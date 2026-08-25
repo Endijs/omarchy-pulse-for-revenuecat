@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.endijs.pulse-for-revenuecat",
+  "name": "Pulse for RevenueCat",
+  "version": "0.3.0",
+  "author": "Endijs",
+  "license": "MIT",
+  "description": "An unofficial multi-project RevenueCat metrics dashboard for Omarchy",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Pulse for RevenueCat",
+    "description": "Configurable RevenueCat totals in the bar with project dashboards",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

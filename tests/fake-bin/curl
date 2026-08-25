@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Consume the stdin curl configuration without recording its Authorization header.
+request_config=$(</dev/stdin)
+: "$request_config"
+unset request_config
+
+url=""
+output=""
+headers=""
+while (( $# > 0 )); do
+  case $1 in
+    --url) url=${2:-}; shift ;;
+    --output) output=${2:-}; shift ;;
+    --dump-header) headers=${2:-}; shift ;;
+    --write-out) shift ;;
+    --config) shift ;;
+  esac
+  shift
+done
+
+printf '%s\n' "$url" >>"${FAKE_CURL_LOG:?}"
+printf 'HTTP/1.1 200 OK\r\n\r\n' >"$headers"
+
+if [[ -n ${FAKE_BLOCK_OVERVIEW_FILE:-} && $url == */metrics/overview* ]]; then
+  : >"$FAKE_BLOCK_OVERVIEW_FILE.ready"
+  for (( wait_index = 0; wait_index < 1000; wait_index++ )); do
+    [[ -e $FAKE_BLOCK_OVERVIEW_FILE.release ]] && break
+    sleep 0.01
+  done
+  [[ -e $FAKE_BLOCK_OVERVIEW_FILE.release ]] || exit 70
+fi
+
+retry_after=${FAKE_RETRY_AFTER:-120}
+
+if [[ ${FAKE_RATE_LIMIT_CHART:-0} == 1 && $url == */charts/* ]]; then
+  printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: %s\r\n\r\n' "$retry_after" >"$headers"
+  printf '{}\n' >"$output"
+  printf '429'
+  exit 0
+fi
+
+if [[ ${FAKE_RATE_LIMIT_OVERVIEW:-0} == 1 && $url == */metrics/overview* ]]; then
+  printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: %s\r\n\r\n' "$retry_after" >"$headers"
+  printf '{}\n' >"$output"
+  printf '429'
+  exit 0
+fi
+
+case $url in
+  *'/v2/projects?'*)
+    projects_json=${FAKE_PROJECTS_JSON:-'{"items":[]}'}
+    printf '%s\n' "$projects_json" >"$output"
+    ;;
+  *'/metrics/overview?'*)
+    printf '%s\n' '{"metrics":[
+      {"id":"mrr","name":"MRR","value":1250,"unit":"$","period":"P0D","last_updated_at":1700000000000},
+      {"id":"revenue","name":"Revenue","value":3900,"unit":"$","period":"P28D","last_updated_at":1700000000000},
+      {"id":"active_subscriptions","value":42,"unit":"#","period":"P0D"},
+      {"id":"active_trials","value":3,"unit":"#","period":"P0D"},
+      {"id":"new_customers","value":12,"unit":"#","period":"P28D"},
+      {"id":"active_users","value":85,"unit":"#","period":"P28D"}
+    ]}' >"$output"
+    ;;
+  *'/charts/'*)
+    printf '%s\n' '{"values":[
+      {"measure":0,"cohort":1699833600,"value":10,"incomplete":false},
+      {"measure":0,"cohort":1699920000,"value":12,"incomplete":false}
+    ]}' >"$output"
+    ;;
+  *)
+    printf '{}\n' >"$output"
+    ;;
+esac
+
+printf '200'

@@ -1,0 +1,1600 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+# This predates the public plugin ID. Keep it stable so existing local keys are
+# not orphaned when the plugin is renamed or upgraded.
+service_name=io.github.endijs.revenue-pulse
+config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/revenue-pulse
+cache_dir=${XDG_CACHE_HOME:-"$HOME/.cache"}/revenue-pulse
+projects_cache_dir=$cache_dir/projects
+config_file=$config_dir/config.json
+cache_file=$cache_dir/metrics.json
+config_lock_file=$config_dir/.config.lock
+
+snapshot_schema_version=3
+metadata_ttl_seconds=86400
+max_parallel_projects=3
+
+cleanup_dirs=()
+config_lock_held=false
+
+cleanup_temp_dirs() {
+  local temp_root=${TMPDIR:-/tmp} dir
+  temp_root=${temp_root%/}
+  for dir in "${cleanup_dirs[@]}"; do
+    [[ -n $dir && $dir == "$temp_root/"* && $dir != "$temp_root/" && -d $dir ]] || continue
+    find "$dir" -mindepth 1 -delete 2>/dev/null || true
+    rmdir -- "$dir" 2>/dev/null || true
+  done
+}
+
+new_work_dir() {
+  local variable_name=$1 created_dir
+  created_dir=$(mktemp -d "${TMPDIR:-/tmp}/revenue-pulse.XXXXXX")
+  cleanup_dirs+=("$created_dir")
+  printf -v "$variable_name" '%s' "$created_dir"
+}
+
+acquire_config_lock() {
+  [[ $config_lock_held == false ]] || fail "Internal error: configuration lock already held"
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir"
+  exec {config_lock_fd}>"$config_lock_file"
+  flock -x "$config_lock_fd"
+  config_lock_held=true
+}
+
+release_config_lock() {
+  [[ $config_lock_held == true ]] || return
+  flock -u "$config_lock_fd"
+  exec {config_lock_fd}>&-
+  config_lock_held=false
+}
+
+trap cleanup_temp_dirs EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+metric_ids=(mrr revenue active_subscriptions active_trials new_customers active_users)
+chart_names=(mrr revenue actives trials customers_new customers_active)
+
+fail() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_tools() {
+  local tool
+  for tool in curl flock jq secret-tool; do
+    command -v "$tool" >/dev/null 2>&1 || fail "Missing dependency: $tool"
+  done
+}
+
+valid_project_id() {
+  [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_currency() {
+  [[ $1 =~ ^[A-Z]{3}$ ]]
+}
+
+valid_metric() {
+  [[ $1 == mrr || $1 == revenue || $1 == active_subscriptions || $1 == active_trials || $1 == new_customers || $1 == active_users ]]
+}
+
+default_config() {
+  jq -cn '{
+    schemaVersion: 2,
+    currency: "USD",
+    revenueType: "revenue",
+    refreshMinutes: 60,
+    selectedProject: "all",
+    barMetric: "mrr",
+    barScope: "all",
+    expandedMetric: "revenue",
+    projects: []
+  }'
+}
+
+normalize_config() {
+  jq -c '
+    def safe_text($fallback):
+      if type != "string" then $fallback else
+        gsub("[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"; "")
+        | gsub("[<>&]"; "")
+        | gsub("[[:space:]]+"; " ")
+        | sub("^[[:space:]]+"; "")
+        | sub("[[:space:]]+$"; "")
+        | .[0:80]
+        | if length > 0 then . else $fallback end
+      end;
+    def defaults: {
+      schemaVersion: 2,
+      currency: "USD",
+      revenueType: "revenue",
+      refreshMinutes: 60,
+      selectedProject: "all",
+      barMetric: "mrr",
+      barScope: "all",
+      expandedMetric: "revenue",
+      projects: []
+    };
+    if (.schemaVersion // 0) == 2 then
+      defaults * .
+    elif ((.projectId // "") | length) > 0 then
+      defaults * {
+        currency: (.currency // "USD"),
+        revenueType: (.revenueType // "revenue"),
+        projects: [{
+          id: .projectId,
+          name: .projectId,
+          iconUrl: "",
+          enabled: true,
+          metadataPermission: "unknown"
+        }]
+      }
+    else
+      defaults
+    end
+    | .schemaVersion = 2
+    | .currency = ((.currency // "USD") | ascii_upcase)
+    | .projects = [(.projects // [])[]
+        | select((.id // "") | length > 0)
+        | .id as $id
+        | {
+            id: $id,
+            name: ((.name // $id) | safe_text($id)),
+            # Remote project images are deliberately inert metadata. QML uses
+            # the project initial and never performs a metadata-selected fetch.
+            iconUrl: "",
+            enabled: (.enabled != false),
+            metadataPermission: (.metadataPermission // "unknown"),
+            metadataFetchedAt: ((.metadataFetchedAt // 0) | tonumber? // 0)
+          }
+      ]
+    | .selectedProject as $selection
+    | if $selection != "all" and ([.projects[].id] | index($selection)) == null
+      then .selectedProject = "all" else . end
+  '
+}
+
+write_config() {
+  local json=$1 temp
+  [[ $config_lock_held == true ]] || fail "Internal error: configuration write without lock"
+  mkdir -p "$config_dir" || return 1
+  chmod 700 "$config_dir" || return 1
+  temp=$(mktemp "$config_dir/.config.XXXXXX") || return 1
+  if ! printf '%s\n' "$json" | jq . >"$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  chmod 600 "$temp"
+  mv -- "$temp" "$config_file"
+}
+
+load_config() {
+  [[ -r $config_file ]] || return 1
+  local raw normalized project_count unique_project_count
+  raw=$(jq -ce . "$config_file") || return 1
+  normalized=$(printf '%s\n' "$raw" | normalize_config) || return 1
+  config_json=$normalized
+  config_needs_write=false
+  [[ $raw == "$normalized" ]] || config_needs_write=true
+
+  local currency revenue_type refresh_minutes bar_metric bar_scope expanded_metric
+  currency=$(jq -r '.currency' <<<"$config_json")
+  revenue_type=$(jq -r '.revenueType' <<<"$config_json")
+  refresh_minutes=$(jq -r '.refreshMinutes' <<<"$config_json")
+  bar_metric=$(jq -r '.barMetric' <<<"$config_json")
+  bar_scope=$(jq -r '.barScope' <<<"$config_json")
+  expanded_metric=$(jq -r '.expandedMetric' <<<"$config_json")
+  valid_currency "$currency" || return 1
+  [[ $revenue_type == revenue || $revenue_type == revenue_net_of_taxes || $revenue_type == proceeds ]] || return 1
+  [[ $refresh_minutes =~ ^[0-9]+$ ]] || return 1
+  (( refresh_minutes >= 5 && refresh_minutes <= 1440 )) || return 1
+  [[ $bar_metric == mrr || $bar_metric == revenue ]] || return 1
+  [[ $bar_scope == all || $bar_scope == selected ]] || return 1
+  valid_metric "$expanded_metric" || return 1
+  jq -e 'all(.projects[]; (.id | test("^[A-Za-z0-9_-]+$")))' <<<"$config_json" >/dev/null || return 1
+  project_count=$(jq '.projects | length' <<<"$config_json")
+  unique_project_count=$(jq '[.projects[].id] | unique | length' <<<"$config_json")
+  (( project_count == unique_project_count )) || return 1
+}
+
+load_or_default_config() {
+  if [[ -e $config_file ]]; then
+    load_config || fail "RevenueCat configuration is invalid: $config_file (fix or move it aside before continuing)"
+  else
+    config_json=$(default_config)
+    config_needs_write=true
+  fi
+}
+
+read_key() {
+  local project_id=$1
+  api_key=$(secret-tool lookup service "$service_name" project "$project_id" 2>/dev/null || true)
+  [[ -n $api_key ]]
+}
+
+clear_secret_verified() {
+  local project_id=$1 matches
+  if secret-tool clear service "$service_name" project "$project_id" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Secret Service reports a non-zero status when the item is already absent.
+  # Verify that state explicitly so removal remains idempotent without masking a
+  # locked/unavailable keyring or a real backend failure.
+  if ! matches=$(secret-tool search --all --unlock service "$service_name" project "$project_id" 2>/dev/null); then
+    return 1
+  fi
+  if [[ -z $matches ]]; then
+    unset matches
+    return 0
+  fi
+  unset matches
+  return 1
+}
+
+clear_all_secrets_verified() {
+  local matches
+  if secret-tool clear service "$service_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! matches=$(secret-tool search --all --unlock service "$service_name" 2>/dev/null); then
+    return 1
+  fi
+  if [[ -z $matches ]]; then
+    unset matches
+    return 0
+  fi
+  unset matches
+  return 1
+}
+
+data_config() {
+  local config=$1
+  jq -cS '{
+    currency,
+    revenueType,
+    projects: [.projects[] | {id,name,iconUrl,enabled}] | sort_by(.id)
+  }' <<<"$config"
+}
+
+project_data_config() {
+  local currency=$1 revenue_type=$2
+  jq -cn --arg currency "$currency" --arg revenueType "$revenue_type" \
+    '{currency:$currency,revenueType:$revenueType}'
+}
+
+project_result_compatible() {
+  local file=$1 project_id=$2 currency=$3 revenue_type=$4
+  [[ -s $file ]] || return 1
+  jq -e \
+    --arg id "$project_id" \
+    --arg currency "$currency" \
+    --arg revenueType "$revenue_type" '
+      .id == $id
+      and .dataConfig.currency == $currency
+      and .dataConfig.revenueType == $revenueType
+      and (.metrics | objects)
+      and (.charts | objects)
+    ' "$file" >/dev/null 2>&1
+}
+
+project_retry_blocked() {
+  local project_id=$1 cache_path retry_path now_ms
+  cache_path=$(project_cache_file "$project_id")
+  retry_path=$(project_retry_file "$project_id")
+  now_ms=$(date +%s%3N)
+  if [[ -s $retry_path ]] && jq -e --arg id "$project_id" --argjson now "$now_ms" '
+      .id == $id and ((.retryAfterAt // 0) | tonumber? // 0) > $now
+    ' "$retry_path" >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ -s $cache_path ]] && jq -e --arg id "$project_id" --argjson now "$now_ms" '
+      .id == $id and ((.retryAfterAt // 0) | tonumber? // 0) > $now
+    ' "$cache_path" >/dev/null 2>&1
+}
+
+project_retry_file() {
+  printf '%s/%s.retry.json\n' "$projects_cache_dir" "$1"
+}
+
+retry_deadline() {
+  local project_id=$1 retry_path cache_path deadline=0 candidate
+  retry_path=$(project_retry_file "$project_id")
+  cache_path=$(project_cache_file "$project_id")
+  for candidate in "$retry_path" "$cache_path"; do
+    [[ -s $candidate ]] || continue
+    candidate=$(jq -r --arg id "$project_id" '
+      if .id == $id then ((.retryAfterAt // 0) | tonumber? // 0) else 0 end
+    ' "$candidate" 2>/dev/null || printf 0)
+    [[ $candidate =~ ^[0-9]+$ ]] || candidate=0
+    (( candidate > deadline )) && deadline=$candidate
+  done
+  printf '%s\n' "$deadline"
+}
+
+persist_retry_deadline() {
+  local project_id=$1 candidate=$2 retry_path current updated temp
+  [[ $candidate =~ ^[0-9]+$ ]] || return 0
+  (( candidate > 0 )) || return 0
+  retry_path=$(project_retry_file "$project_id")
+  current=$(retry_deadline "$project_id")
+  (( candidate > current )) || return 0
+  updated=$(jq -cn --arg id "$project_id" --argjson retryAfterAt "$candidate" \
+    '{id:$id,retryAfterAt:$retryAfterAt}')
+  new_work_dir temp
+  printf '%s\n' "$updated" >"$temp/retry.json"
+  write_json_file_atomic "$retry_path" "$temp/retry.json"
+}
+
+write_json_file_atomic() {
+  local target=$1 source=$2 directory temp
+  directory=${target%/*}
+  mkdir -p "$directory"
+  chmod 700 "$directory"
+  temp=$(mktemp "$directory/.cache.XXXXXX")
+  if ! jq . "$source" >"$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  chmod 600 "$temp"
+  mv -- "$temp" "$target"
+}
+
+api_request() {
+  local key=$1 url=$2 output=$3 curl_status headers retry_after retry_epoch escaped_key retry_seconds now_epoch
+  headers=$output.headers
+  curl_status=0
+  API_RETRY_AFTER_AT=0
+  escaped_key=${key//\\/\\\\}
+  escaped_key=${escaped_key//\"/\\\"}
+  API_HTTP_STATUS=$({
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped_key"
+    printf '%s\n' \
+      'silent' \
+      'show-error' \
+      'connect-timeout = 5' \
+      'max-time = 25' \
+      'retry = 1' \
+      'retry-delay = 1' \
+      'retry-max-time = 5'
+  } | curl -q --config - --proto '=https' --url "$url" --output "$output" --dump-header "$headers" --write-out '%{http_code}') || curl_status=$?
+  if (( curl_status != 0 )); then
+    API_HTTP_STATUS=000
+    return 1
+  fi
+
+  retry_after=$(awk -F: 'tolower($1) == "retry-after" {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0} END {print value}' "$headers" 2>/dev/null || true)
+  now_epoch=$(date +%s)
+  if [[ $retry_after =~ ^[0-9]{1,10}$ ]]; then
+    retry_seconds=$(( 10#$retry_after ))
+    API_RETRY_AFTER_AT=$(( (now_epoch + retry_seconds) * 1000 ))
+  elif [[ -n $retry_after ]] && retry_epoch=$(date -d "$retry_after" +%s 2>/dev/null); then
+    (( retry_epoch > now_epoch )) && API_RETRY_AFTER_AT=$(( retry_epoch * 1000 ))
+  fi
+  [[ $API_HTTP_STATUS =~ ^2[0-9][0-9]$ ]]
+}
+
+stop_after_request_failure() {
+  case $1 in
+    000|401|403|404|408|423|429|5??) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_project_requests() {
+  case $1 in
+    000|401|404|408|423|429|5??) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+append_issue() {
+  local current=$1 severity=$2 code=$3 permission=$4 message=$5
+  jq -c \
+    --arg severity "$severity" \
+    --arg code "$code" \
+    --arg permission "$permission" \
+    --arg message "$message" \
+    '. + [{severity:$severity,code:$code,permission:$permission,message:$message}]' <<<"$current"
+}
+
+http_issue() {
+  local current=$1 status=$2 project_name=$3 permission=$4 label=$5
+  case $status in
+    401)
+      append_issue "$current" error invalid_key "" "$project_name: the API key was rejected. Reconnect this project with a valid v2 secret key."
+      ;;
+    403)
+      append_issue "$current" warning missing_permission "$permission" "$project_name: the key is missing $permission, so $label is unavailable."
+      ;;
+    404)
+      append_issue "$current" error project_not_found "" "$project_name: the project was not found or this key cannot access it."
+      ;;
+    429)
+      append_issue "$current" warning rate_limited "" "$project_name: RevenueCat rate-limited this refresh; cached data will be used."
+      ;;
+    000)
+      append_issue "$current" warning network "" "$project_name: RevenueCat could not be reached; cached data will be used."
+      ;;
+    *)
+      append_issue "$current" warning api_error "" "$project_name: RevenueCat returned HTTP $status while loading $label."
+      ;;
+  esac
+}
+
+project_cache_file() {
+  printf '%s/%s.json\n' "$projects_cache_dir" "$1"
+}
+
+discover_metadata() {
+  local key=$1 project_id=$2 output=$3 normalized=$4
+  if api_request "$key" 'https://api.revenuecat.com/v2/projects?limit=100' "$output"; then
+    jq -ce --arg id "$project_id" '
+      def safe_text($fallback):
+        if type != "string" then $fallback else
+          gsub("[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"; "")
+          | gsub("[<>&]"; "")
+          | gsub("[[:space:]]+"; " ")
+          | sub("^[[:space:]]+"; "")
+          | sub("[[:space:]]+$"; "")
+          | .[0:80]
+          | if length > 0 then . else $fallback end
+        end;
+      .items[]? | select(.id == $id) | . as $item |
+      {name:(($item.name // $item.id) | safe_text($item.id)),iconUrl:""}
+    ' "$output" >"$normalized" 2>/dev/null || return 2
+    return 0
+  fi
+  return 1
+}
+
+chart_url() {
+  local project_id=$1 chart_name=$2 currency=$3 revenue_type=$4 start_date=$5 end_date=$6
+  local selectors=""
+  if [[ $chart_name == revenue ]]; then
+    selectors="&selectors=%7B%22revenue_type%22%3A%22${revenue_type}%22%7D"
+  fi
+  printf 'https://api.revenuecat.com/v2/projects/%s/charts/%s?currency=%s&start_date=%s&end_date=%s&realtime=true&resolution=0%s' \
+    "$project_id" "$chart_name" "$currency" "$start_date" "$end_date" "$selectors"
+}
+
+normalize_chart() {
+  jq -c '[
+    .values[]?
+    | select((.measure // 0) == 0)
+    | {
+        at: (.cohort | tonumber),
+        value: (.value | tonumber? // 0),
+        incomplete: (.incomplete == true)
+      }
+  ] | sort_by(.at)' "$1"
+}
+
+normalize_metrics() {
+  jq -c '
+    reduce (.metrics[]?) as $metric ({};
+      .[$metric.id] = {
+        id: $metric.id,
+        name: ($metric.name // $metric.id),
+        value: ($metric.value | tonumber? // 0),
+        unit: ($metric.unit // ""),
+        period: ($metric.period // ""),
+        lastUpdatedAt: ($metric.last_updated_at // 0)
+      }
+    )
+  ' "$1"
+}
+
+process_project() {
+  local project=$1 result_file=$2 work_dir=$3 currency=$4 revenue_type=$5
+  local project_id project_name icon_url enabled cache_path data_context
+  local metadata_permission metadata_fetched_at retry_after_at=0 now_ms
+  project_id=$(jq -r '.id' <<<"$project")
+  project_name=$(jq -r '.name // .id' <<<"$project")
+  icon_url=$(jq -r '.iconUrl // ""' <<<"$project")
+  enabled=$(jq -r '.enabled != false' <<<"$project")
+  metadata_permission=$(jq -r '.metadataPermission // "unknown"' <<<"$project")
+  metadata_fetched_at=$(jq -r '.metadataFetchedAt // 0' <<<"$project")
+  now_ms=$(date +%s%3N)
+  data_context=$(project_data_config "$currency" "$revenue_type")
+  valid_project_id "$project_id" || return 1
+  cache_path=$(project_cache_file "$project_id")
+
+  local issues='[]' permissions metrics='{}' charts='{}'
+  local ok=false stale=false fetched_at=0 metadata_status=unknown overview_status=unknown charts_status=unknown
+  local skip_remaining_requests=false
+  local key="" metadata_file metadata_normalized overview_file metadata_json status
+
+  if ! read_key "$project_id"; then
+    issues=$(append_issue "$issues" error missing_key "" "$project_name: no API key is stored. Reconnect this project.")
+    if project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+      metrics=$(jq -c '.metrics // {}' "$cache_path")
+      charts=$(jq -c '.charts // {}' "$cache_path")
+      fetched_at=$(jq -r '.fetchedAt // 0' "$cache_path")
+      retry_after_at=$(jq -r '.retryAfterAt // 0' "$cache_path")
+      ok=true
+      stale=true
+    fi
+    permissions=$(jq -cn '{projects:"unknown",overview:"unknown",charts:"unknown"}')
+    jq -cn \
+      --arg id "$project_id" --arg name "$project_name" --arg iconUrl "$icon_url" \
+      --argjson enabled "$enabled" --argjson ok "$ok" --argjson stale "$stale" \
+      --argjson fetchedAt "$fetched_at" --argjson metrics "$metrics" --argjson charts "$charts" \
+      --argjson permissions "$permissions" --argjson issues "$issues" --argjson dataConfig "$data_context" \
+      --argjson metadataFetchedAt "$metadata_fetched_at" --argjson retryAfterAt "$retry_after_at" \
+      '{id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
+      >"$result_file"
+    return
+  fi
+  key=$api_key
+  unset api_key
+
+  if (( metadata_fetched_at > 0 && metadata_fetched_at < 100000000000 )); then
+    metadata_fetched_at=$(( metadata_fetched_at * 1000 ))
+  fi
+  if (( metadata_fetched_at > 0 && now_ms - metadata_fetched_at < metadata_ttl_seconds * 1000 )); then
+    metadata_status=$metadata_permission
+  else
+    metadata_file=$work_dir/$project_id-metadata.json
+    metadata_normalized=$work_dir/$project_id-metadata-normalized.json
+    metadata_fetched_at=$now_ms
+    if discover_metadata "$key" "$project_id" "$metadata_file" "$metadata_normalized"; then
+      metadata_json=$(<"$metadata_normalized")
+      project_name=$(jq -r '.name' <<<"$metadata_json")
+      icon_url=$(jq -r '.iconUrl' <<<"$metadata_json")
+      metadata_status=ok
+    else
+      status=$?
+      (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+      if (( status == 1 )); then
+        metadata_status=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
+        issues=$(http_issue "$issues" "$API_HTTP_STATUS" "$project_name" project_configuration:projects:read 'the project name and icon')
+        stop_project_requests "$API_HTTP_STATUS" && skip_remaining_requests=true
+      else
+        metadata_status=error
+        issues=$(append_issue "$issues" warning metadata_missing "" "$project_name: the key did not return this project from the projects list; using the saved label.")
+      fi
+    fi
+  fi
+
+  if [[ $skip_remaining_requests == false ]]; then
+    overview_file=$work_dir/$project_id-overview.json
+    if api_request "$key" "https://api.revenuecat.com/v2/projects/$project_id/metrics/overview?currency=$currency" "$overview_file"; then
+      if jq -e '.metrics | arrays' "$overview_file" >/dev/null 2>&1; then
+        metrics=$(normalize_metrics "$overview_file")
+        overview_status=ok
+        ok=true
+        fetched_at=$(date +%s%3N)
+      else
+        overview_status=error
+        issues=$(append_issue "$issues" warning invalid_response "" "$project_name: RevenueCat returned an unexpected overview response.")
+      fi
+    else
+      overview_status=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
+      (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+      issues=$(http_issue "$issues" "$API_HTTP_STATUS" "$project_name" charts_metrics:overview:read 'overview metrics')
+      stop_project_requests "$API_HTTP_STATUS" && skip_remaining_requests=true
+    fi
+  fi
+
+  local start_date end_date index metric_id chart_name chart_file chart_data chart_failed=false
+  start_date=$(date -u -d '27 days ago' +%F)
+  end_date=$(date -u +%F)
+  for index in "${!metric_ids[@]}"; do
+    [[ $skip_remaining_requests == false ]] || break
+    metric_id=${metric_ids[$index]}
+    chart_name=${chart_names[$index]}
+    chart_file=$work_dir/$project_id-$chart_name.json
+    if api_request "$key" "$(chart_url "$project_id" "$chart_name" "$currency" "$revenue_type" "$start_date" "$end_date")" "$chart_file"; then
+      if chart_data=$(normalize_chart "$chart_file"); then
+        charts=$(jq -c --arg id "$metric_id" --argjson values "$chart_data" '.[$id] = $values' <<<"$charts")
+        charts_status=ok
+      else
+        chart_failed=true
+        issues=$(append_issue "$issues" warning invalid_chart "" "$project_name: RevenueCat returned an unexpected $metric_id chart.")
+      fi
+    else
+      chart_failed=true
+      charts_status=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
+      (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+      issues=$(http_issue "$issues" "$API_HTTP_STATUS" "$project_name" charts_metrics:charts:read "$metric_id chart")
+      stop_after_request_failure "$API_HTTP_STATUS" && break
+    fi
+    (( index + 1 < ${#metric_ids[@]} )) && sleep 0.15
+  done
+  unset key
+
+  if [[ $ok != true ]] && project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+    metrics=$(jq -c '.metrics // {}' "$cache_path")
+    charts=$(jq -c '.charts // {}' "$cache_path")
+    fetched_at=$(jq -r '.fetchedAt // 0' "$cache_path")
+    ok=true
+    stale=true
+  elif [[ $chart_failed == true ]] && project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+    local cached_charts
+    cached_charts=$(jq -c '.charts // {}' "$cache_path")
+    charts=$(jq -cn --argjson fresh "$charts" --argjson cached "$cached_charts" '$cached * $fresh')
+    stale=true
+  fi
+
+  permissions=$(jq -cn \
+    --arg projects "$metadata_status" \
+    --arg overview "$overview_status" \
+    --arg charts "$charts_status" \
+    '{projects:$projects,overview:$overview,charts:$charts}')
+
+  jq -cn \
+    --arg id "$project_id" --arg name "$project_name" --arg iconUrl "$icon_url" \
+    --argjson enabled "$enabled" --argjson ok "$ok" --argjson stale "$stale" \
+    --argjson fetchedAt "$fetched_at" --argjson metrics "$metrics" --argjson charts "$charts" \
+    --argjson permissions "$permissions" --argjson issues "$issues" --argjson dataConfig "$data_context" \
+    --argjson metadataFetchedAt "$metadata_fetched_at" --argjson retryAfterAt "$retry_after_at" \
+    '{id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
+    >"$result_file"
+}
+
+aggregate_snapshot() {
+  local projects=$1 config=$2 demo=${3:-false}
+  jq -cn \
+    --argjson projects "$projects" \
+    --argjson config "$config" \
+    --argjson demo "$demo" \
+    --argjson schemaVersion "$snapshot_schema_version" '
+      def metric_ids: ["mrr","revenue","active_subscriptions","active_trials","new_customers","active_users"];
+      def data_config($saved): {
+        currency: $saved.currency,
+        revenueType: $saved.revenueType,
+        projects: ([$saved.projects[] | {id,name,iconUrl,enabled}] | sort_by(.id))
+      };
+      def summed_metrics($ps):
+        [$ps[] | .metrics | to_entries[]?]
+        | group_by(.key)
+        | map({
+            key: .[0].key,
+            value: (.[0].value + {value: (map(.value.value) | add)})
+          })
+        | from_entries;
+      def summed_chart($ps; $id):
+        [$ps[] | .charts[$id][]?]
+        | group_by(.at)
+        | map({
+            at: .[0].at,
+            value: (map(.value) | add),
+            incomplete: (map(.incomplete == true) | any)
+          })
+        | sort_by(.at);
+      def summed_charts($ps):
+        reduce metric_ids[] as $id ({}; .[$id] = summed_chart($ps; $id));
+      ($projects | map(select(.enabled and ((.metrics | length) > 0)))) as $usable
+      | ($config.selectedProject // "all") as $requestedSelection
+      | (if $requestedSelection == "all" or ([$projects[].id] | index($requestedSelection)) != null
+         then $requestedSelection else "all" end) as $selection
+      | {
+          schemaVersion: $schemaVersion,
+          dataConfig: data_config($config),
+          configured: (($config.projects | length) > 0),
+          ok: (($usable | length) > 0),
+          stale: ([$projects[].stale] | any),
+          demo: $demo,
+          currency: $config.currency,
+          fetchedAt: ([$projects[].fetchedAt] | max // 0),
+          settings: {
+            refreshMinutes: $config.refreshMinutes,
+            selectedProject: $selection,
+            barMetric: $config.barMetric,
+            barScope: $config.barScope,
+            expandedMetric: $config.expandedMetric,
+            revenueType: $config.revenueType
+          },
+          projects: $projects,
+          totals: {
+            id: "all",
+            name: "All projects",
+            iconUrl: "",
+            ok: (($usable | length) > 0),
+            stale: ([$usable[].stale] | any),
+            fetchedAt: ([$usable[].fetchedAt] | max // 0),
+            metrics: summed_metrics($usable),
+            charts: summed_charts($usable)
+          },
+          stats: {
+            totalProjects: ($config.projects | length),
+            updatedProjects: ([$projects[] | select(.ok)] | length)
+          },
+          issues: [$projects[].issues[]?]
+        }
+    '
+}
+
+persist_discovered_metadata_unlocked() {
+  local projects=$1 updated
+  [[ $config_lock_held == true ]] || fail "Internal error: metadata update without lock"
+  updated=$(jq -c --argjson results "$projects" '
+    .projects |= map(. as $saved |
+      ($results | map(select(.id == $saved.id))[0] // null) as $fresh |
+      (($fresh.metadataFetchedAt // 0) | tonumber? // 0) as $freshAt |
+      ((.metadataFetchedAt // 0) | tonumber? // 0) as $savedAt |
+      if $fresh == null or $freshAt < $savedAt then . else
+        .name = ($fresh.name // .name)
+        | .iconUrl = ($fresh.iconUrl // .iconUrl)
+        | .metadataPermission = ($fresh.permissions.projects // .metadataPermission)
+        | .metadataFetchedAt = ($fresh.metadataFetchedAt // .metadataFetchedAt // 0)
+      end
+    )
+  ' <<<"$config_json")
+  config_json=$updated
+  if [[ $config_needs_write == true || $updated != "$(jq -c . "$config_file" 2>/dev/null || true)" ]]; then
+    write_config "$config_json"
+    config_needs_write=false
+  fi
+}
+
+placeholder_project() {
+  local project=$1 currency=$2 revenue_type=$3 data_context
+  data_context=$(project_data_config "$currency" "$revenue_type")
+  jq -cn --argjson project "$project" --argjson dataConfig "$data_context" '{
+    id: $project.id,
+    name: $project.name,
+    iconUrl: $project.iconUrl,
+    enabled: $project.enabled,
+    ok: false,
+    stale: false,
+    fetchedAt: 0,
+    metadataFetchedAt: ($project.metadataFetchedAt // 0),
+    retryAfterAt: 0,
+    dataConfig: $dataConfig,
+    metrics: {},
+    charts: {},
+    permissions: {projects:($project.metadataPermission // "unknown"),overview:"unknown",charts:"unknown"},
+    issues: []
+  }'
+}
+
+assemble_projects() {
+  local config=$1 fresh_dir=${2:-} currency revenue_type project project_id fresh_file cache_path source_file item projects='[]' retry_after_at
+  currency=$(jq -r '.currency' <<<"$config")
+  revenue_type=$(jq -r '.revenueType' <<<"$config")
+  while IFS= read -r project; do
+    project_id=$(jq -r '.id' <<<"$project")
+    fresh_file=${fresh_dir:+$fresh_dir/result-$project_id.json}
+    cache_path=$(project_cache_file "$project_id")
+    source_file=""
+    if [[ -n $fresh_file ]] && project_result_compatible "$fresh_file" "$project_id" "$currency" "$revenue_type"; then
+      source_file=$fresh_file
+    elif project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+      source_file=$cache_path
+    fi
+
+    if [[ -n $source_file ]]; then
+      item=$(jq -c --argjson saved "$project" '
+        .name = $saved.name
+        | .iconUrl = $saved.iconUrl
+        | .enabled = $saved.enabled
+        | .metadataFetchedAt = ($saved.metadataFetchedAt // .metadataFetchedAt // 0)
+      ' "$source_file")
+    else
+      item=$(placeholder_project "$project" "$currency" "$revenue_type")
+    fi
+    retry_after_at=$(retry_deadline "$project_id")
+    item=$(jq -c --argjson retryAfterAt "$retry_after_at" \
+      '.retryAfterAt = ([((.retryAfterAt // 0) | tonumber? // 0), $retryAfterAt] | max)' <<<"$item")
+    projects=$(jq -c --argjson item "$item" '. + [$item]' <<<"$projects")
+  done < <(jq -c '.projects[]' <<<"$config")
+  printf '%s\n' "$projects"
+}
+
+unconfigured_snapshot() {
+  local config
+  config=$(default_config)
+  aggregate_snapshot '[]' "$config" false
+}
+
+cached_snapshot() {
+  if [[ ! -e $config_file ]]; then
+    unconfigured_snapshot
+    return
+  fi
+  if ! load_config; then
+    local invalid
+    invalid=$(unconfigured_snapshot)
+    jq -c '.issues = [{severity:"error",code:"invalid_config",permission:"",message:"RevenueCat configuration is invalid; open the terminal manager for details."}]' <<<"$invalid"
+    return
+  fi
+
+  local expected_data_config projects
+  expected_data_config=$(data_config "$config_json")
+  if [[ -r $cache_file ]] && jq -e \
+    --argjson schemaVersion "$snapshot_schema_version" \
+    --argjson expected "$expected_data_config" '
+      .schemaVersion == $schemaVersion
+      and .dataConfig == $expected
+      and (.projects | arrays)
+      and (.totals | objects)
+    ' "$cache_file" >/dev/null 2>&1; then
+    jq -c --argjson config "$config_json" '
+      .settings = {
+        refreshMinutes: $config.refreshMinutes,
+        selectedProject: $config.selectedProject,
+        barMetric: $config.barMetric,
+        barScope: $config.barScope,
+        expandedMetric: $config.expandedMetric,
+        revenueType: $config.revenueType
+      }
+    ' "$cache_file"
+    return
+  fi
+
+  projects=$(assemble_projects "$config_json")
+  aggregate_snapshot "$projects" "$config_json" false
+}
+
+wait_for_project_batch() {
+  local pid failed=false
+  for pid in "$@"; do
+    wait "$pid" || failed=true
+  done
+  [[ $failed == false ]]
+}
+
+fetch_metrics() {
+  require_tools
+  if [[ ! -e $config_file ]]; then
+    unconfigured_snapshot
+    return
+  fi
+  load_config || fail "RevenueCat configuration is invalid: $config_file"
+
+  local work_dir project_count currency revenue_type project project_id result_file projects snapshot
+  local requested_id fresh_results current_project cache_path retry_after_at
+  local -a requested_projects=() eligible_projects=() pids=()
+  local -A seen_project_ids=()
+  new_work_dir work_dir
+  currency=$(jq -r '.currency' <<<"$config_json")
+  revenue_type=$(jq -r '.revenueType' <<<"$config_json")
+
+  if (( $# == 0 )) || [[ ${1:-} == all ]]; then
+    mapfile -t requested_projects < <(jq -c '.projects[]' <<<"$config_json")
+  else
+    for requested_id in "$@"; do
+      valid_project_id "$requested_id" || fail "Invalid project ID: $requested_id"
+      project=$(jq -ce --arg id "$requested_id" '.projects[] | select(.id == $id)' <<<"$config_json") \
+        || fail "Project is not configured: $requested_id"
+      if [[ -z ${seen_project_ids[$requested_id]+present} ]]; then
+        requested_projects+=("$project")
+        seen_project_ids[$requested_id]=true
+      fi
+    done
+  fi
+
+  for project in "${requested_projects[@]}"; do
+    project_id=$(jq -r '.id' <<<"$project")
+    project_retry_blocked "$project_id" || eligible_projects+=("$project")
+  done
+  requested_projects=("${eligible_projects[@]}")
+
+  project_count=${#requested_projects[@]}
+  if (( project_count == 0 )); then
+    projects=$(assemble_projects "$config_json")
+    aggregate_snapshot "$projects" "$config_json" false
+    return
+  fi
+
+  for project in "${requested_projects[@]}"; do
+    project_id=$(jq -r '.id' <<<"$project")
+    result_file=$work_dir/result-$project_id.json
+    process_project "$project" "$result_file" "$work_dir" "$currency" "$revenue_type" &
+    pids+=("$!")
+    if (( ${#pids[@]} >= max_parallel_projects )); then
+      wait_for_project_batch "${pids[@]}" || fail "A RevenueCat project refresh failed unexpectedly"
+      pids=()
+    fi
+  done
+  if (( ${#pids[@]} > 0 )); then
+    wait_for_project_batch "${pids[@]}" || fail "A RevenueCat project refresh failed unexpectedly"
+  fi
+
+  fresh_results=$(jq -cs '.' "$work_dir"/result-*.json)
+
+  # Network operations intentionally happen before this lock. Re-read and
+  # reconcile the current config so a concurrent settings/project mutation is
+  # never overwritten by a stale fetch transaction.
+  acquire_config_lock
+  if [[ ! -e $config_file ]]; then
+    release_config_lock
+    unconfigured_snapshot
+    return
+  fi
+  load_config || { release_config_lock; fail "RevenueCat configuration became invalid during refresh"; }
+  persist_discovered_metadata_unlocked "$fresh_results"
+  currency=$(jq -r '.currency' <<<"$config_json")
+  revenue_type=$(jq -r '.revenueType' <<<"$config_json")
+
+  while IFS= read -r current_project; do
+    project_id=$(jq -r '.id' <<<"$current_project")
+    result_file=$work_dir/result-$project_id.json
+    if [[ -s $result_file ]]; then
+      retry_after_at=$(jq -r '((.retryAfterAt // 0) | tonumber? // 0)' "$result_file" 2>/dev/null || printf 0)
+      persist_retry_deadline "$project_id" "$retry_after_at"
+    fi
+    if project_result_compatible "$result_file" "$project_id" "$currency" "$revenue_type"; then
+      cache_path=$(project_cache_file "$project_id")
+      write_json_file_atomic "$cache_path" "$result_file"
+    fi
+  done < <(jq -c '.projects[]' <<<"$config_json")
+
+  projects=$(assemble_projects "$config_json" "$work_dir")
+  snapshot=$(aggregate_snapshot "$projects" "$config_json" false)
+  printf '%s\n' "$snapshot" | jq . >"$work_dir/snapshot.json"
+  write_json_file_atomic "$cache_file" "$work_dir/snapshot.json"
+  release_config_lock
+  printf '%s\n' "$snapshot"
+}
+
+demo() {
+  local now projects config
+  now=$(date +%s)
+  projects=$(jq -cn --argjson now "$now" '
+    def cents: ((. * 100) | round) / 100;
+    def shifted($values; $i; $phase):
+      $values[(($i + $phase) % ($values | length))];
+    def points($values; $partial):
+      [range(0; 28) as $i | {
+        at: ($now - ((27 - $i) * 86400)),
+        value: $values[$i],
+        incomplete: ($partial and $i == 27)
+      }];
+    def stock($base; $scale; $phase; $changes; $money):
+      (reduce range(0; 28) as $i ({current:$base,values:[]};
+        .current += (shifted($changes; $i; $phase) * $scale)
+        | .values += [
+            if $money then (.current | cents)
+            else (.current | round)
+            end
+          ]
+      )) | .values;
+    def flow($base; $drift; $phase; $week; $noise; $today_factor; $money):
+      [range(0; 28) as $i
+        | ($base
+          + ($i * $drift)
+          + ($base * shifted($week; $i; $phase))
+          + ($base * shifted($noise; $i; ($phase * 3)))) as $value
+        | ($value * (if $i == 27 then $today_factor else 1 end))
+        | if . < 0 then 0
+          elif $money then cents
+          else round
+          end
+      ];
+    def mrr_values($profile):
+      stock(
+        $profile.mrrBase;
+        $profile.mrrScale;
+        $profile.phase;
+        [-8,17,0,11,26,-5,14,0,-3,22,9,-10,7,15,0,-6,18];
+        true
+      );
+    def subscription_values($profile):
+      stock(
+        $profile.subscriptionBase;
+        $profile.subscriptionScale;
+        ($profile.phase + 4);
+        [0,2,1,-1,3,0,-2,1,4,0,-1,2,1,-2,3,0,1];
+        false
+      );
+    def trial_values($profile):
+      stock(
+        $profile.trialBase;
+        $profile.trialScale;
+        ($profile.phase + 9);
+        [1,0,-2,2,-1,3,-2,0,1,-1,2,-3,1,0,2,-1,0];
+        false
+      );
+    def revenue_values($profile):
+      flow(
+        $profile.revenueBase;
+        $profile.revenueDrift;
+        $profile.phase;
+        [0.08,-0.04,0.12,0.21,0.03,-0.18,-0.24];
+        [-0.06,0.03,0.14,-0.02,0.05,-0.09,0.01,0.18,-0.04,0.07,-0.12,0.02,0.09,-0.03,0.04,-0.08,0.11];
+        0.78;
+        true
+      );
+    def new_customer_values($profile):
+      flow(
+        $profile.customerBase;
+        $profile.customerDrift;
+        ($profile.phase + 2);
+        [0.04,0.13,0.19,0.08,-0.05,-0.22,-0.17];
+        [-0.08,0.05,-0.03,0.12,-0.04,0.08,-0.11,0.03,0.16,-0.06,0.02,-0.09,0.07,0.01,-0.05,0.1,-0.02];
+        0.82;
+        false
+      );
+    def active_user_values($profile):
+      flow(
+        $profile.activeUserBase;
+        $profile.activeUserDrift;
+        ($profile.phase + 5);
+        [0.03,0.11,0.16,0.09,-0.02,-0.18,-0.22];
+        [-0.04,0.02,0.07,-0.01,0.04,-0.05,0.01,0.09,-0.03,0.05,-0.07,0.02,0.06,-0.02,0.03,-0.06,0.08];
+        0.86;
+        false
+      );
+    def metric($id; $name; $value; $unit; $period):
+      {id:$id,name:$name,value:$value,unit:$unit,period:$period,lastUpdatedAt:($now * 1000)};
+    def project($id; $name; $profile):
+      (mrr_values($profile)) as $mrr
+      | (revenue_values($profile)) as $revenue
+      | (subscription_values($profile)) as $subscriptions
+      | (trial_values($profile)) as $trials
+      | (new_customer_values($profile)) as $new_customers
+      | (active_user_values($profile)) as $active_users
+      | {
+          id:$id,
+          name:$name,
+          iconUrl:"",
+          enabled:true,
+          ok:true,
+          stale:false,
+          fetchedAt:($now * 1000),
+          metrics:{
+            mrr: metric("mrr";"Monthly Recurring Revenue";$mrr[-1];"$";"P0D"),
+            revenue: metric("revenue";"Revenue";(($revenue | add) | cents);"$";"P28D"),
+            active_subscriptions: metric("active_subscriptions";"Active Subscriptions";$subscriptions[-1];"#";"P0D"),
+            active_trials: metric("active_trials";"Active Trials";$trials[-1];"#";"P0D"),
+            new_customers: metric("new_customers";"New Customers";($new_customers | add);"#";"P28D"),
+            active_users: metric("active_users";"Active Users";(((($active_users | add) * $profile.activeUserShare) | round));"#";"P28D")
+          },
+          charts:{
+            mrr: points($mrr;false),
+            revenue: points($revenue;true),
+            active_subscriptions: points($subscriptions;false),
+            active_trials: points($trials;false),
+            new_customers: points($new_customers;true),
+            active_users: points($active_users;true)
+          },
+          permissions:{projects:"ok",overview:"ok",charts:"ok"},
+          issues:[]
+        };
+    [
+      project("demo-one";"Orbit Notes";{
+        phase:0,
+        mrrBase:1115,mrrScale:0.72,
+        revenueBase:135,revenueDrift:0.32,
+        subscriptionBase:438,subscriptionScale:1.2,
+        trialBase:34,trialScale:1,
+        customerBase:21,customerDrift:0.04,
+        activeUserBase:370,activeUserDrift:0.7,activeUserShare:0.26
+      }),
+      project("demo-two";"Tiny Habits";{
+        phase:5,
+        mrrBase:548,mrrScale:0.58,
+        revenueBase:71,revenueDrift:0.46,
+        subscriptionBase:194,subscriptionScale:0.86,
+        trialBase:17,trialScale:0.72,
+        customerBase:12,customerDrift:0.09,
+        activeUserBase:174,activeUserDrift:0.9,activeUserShare:0.29
+      }),
+      project("demo-three";"Focus Garden";{
+        phase:11,
+        mrrBase:1588,mrrScale:0.42,
+        revenueBase:181,revenueDrift:-0.08,
+        subscriptionBase:624,subscriptionScale:0.64,
+        trialBase:46,trialScale:1.15,
+        customerBase:28,customerDrift:-0.02,
+        activeUserBase:532,activeUserDrift:-0.35,activeUserShare:0.25
+      })
+    ]
+  ')
+  config=$(default_config)
+  config=$(jq -c --argjson projects "$projects" '
+    .barMetric = "revenue"
+    | .projects = [$projects[] | {
+      id,
+      name,
+      iconUrl,
+      enabled,
+      metadataPermission:"ok",
+      metadataFetchedAt:0
+    }]
+  ' <<<"$config")
+  aggregate_snapshot "$projects" "$config" true
+}
+
+upsert_project() {
+  local config=$1 project_id=$2 name=$3 icon_url=$4 metadata_permission=$5 metadata_fetched_at=$6
+  jq -c \
+    --arg id "$project_id" \
+    --arg name "$name" \
+    --arg iconUrl "$icon_url" \
+    --arg metadataPermission "$metadata_permission" \
+    --argjson metadataFetchedAt "$metadata_fetched_at" '
+      (.projects | map(select(.id == $id))[0] // {}) as $old
+      | .projects = ([.projects[] | select(.id != $id)] + [{
+          id:$id,
+          name:(if ($name | length) > 0 then $name else ($old.name // $id) end),
+          iconUrl:(if ($iconUrl | length) > 0 then $iconUrl else ($old.iconUrl // "") end),
+          enabled:($old.enabled // true),
+          metadataPermission:$metadataPermission,
+          metadataFetchedAt:$metadataFetchedAt
+        }] | sort_by(.name | ascii_downcase))
+    ' <<<"$config"
+}
+
+configure_project() {
+  require_tools
+  load_or_default_config
+  local requested_project=${1:-} currency key work_dir overview_file chart_file metadata_file metadata_normalized
+  local overview_status chart_status metadata_status metadata_json project_name icon_url metadata_permission issues='[]'
+  local metadata_fetched_at=0 old_key="" had_old_key=false updated rollback_ok existing_project
+  local retry_after_at=0 skip_remaining_requests=false
+  currency=$(jq -r '.currency' <<<"$config_json")
+
+  if [[ -z $requested_project ]]; then
+    read -r -p 'RevenueCat project ID: ' requested_project
+  fi
+  valid_project_id "$requested_project" || fail "Project ID may contain only letters, numbers, underscores, and hyphens"
+
+  read -r -s -p 'RevenueCat v2 secret API key: ' key
+  printf '\n'
+  [[ $key == sk_* ]] || fail "Expected a RevenueCat v2 secret key beginning with sk_"
+
+  new_work_dir work_dir
+  overview_file=$work_dir/overview.json
+  chart_file=$work_dir/chart.json
+  metadata_file=$work_dir/projects.json
+  metadata_normalized=$work_dir/project-metadata.json
+  project_name=$requested_project
+  icon_url=""
+  metadata_permission=unknown
+
+  if api_request "$key" "https://api.revenuecat.com/v2/projects/$requested_project/metrics/overview?currency=$currency" "$overview_file"; then
+    overview_status=ok
+  else
+    overview_status=$API_HTTP_STATUS
+    (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+    [[ $overview_status == 401 || $overview_status == 404 ]] && fail "The key was rejected or cannot access project $requested_project"
+    issues=$(http_issue "$issues" "$overview_status" "$requested_project" charts_metrics:overview:read 'overview metrics')
+    stop_project_requests "$overview_status" && skip_remaining_requests=true
+  fi
+
+  local start_date end_date
+  start_date=$(date -u -d '2 days ago' +%F)
+  end_date=$(date -u +%F)
+  if [[ $skip_remaining_requests == false ]]; then
+    if api_request "$key" "$(chart_url "$requested_project" revenue "$currency" revenue "$start_date" "$end_date")" "$chart_file"; then
+      chart_status=ok
+    else
+      chart_status=$API_HTTP_STATUS
+      (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+      issues=$(http_issue "$issues" "$chart_status" "$requested_project" charts_metrics:charts:read 'charts')
+      stop_project_requests "$chart_status" && skip_remaining_requests=true
+    fi
+  fi
+
+  if [[ $skip_remaining_requests == false ]]; then
+    metadata_fetched_at=$(date +%s%3N)
+    if discover_metadata "$key" "$requested_project" "$metadata_file" "$metadata_normalized"; then
+      metadata_json=$(<"$metadata_normalized")
+      project_name=$(jq -r '.name' <<<"$metadata_json")
+      icon_url=$(jq -r '.iconUrl' <<<"$metadata_json")
+      metadata_permission=ok
+      metadata_status=ok
+    else
+      metadata_status=$?
+      (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
+      if (( metadata_status == 1 )); then
+        metadata_permission=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
+        issues=$(http_issue "$issues" "$API_HTTP_STATUS" "$requested_project" project_configuration:projects:read 'the project name and icon')
+      else
+        metadata_permission=error
+        issues=$(append_issue "$issues" warning metadata_missing "" "$requested_project: the projects endpoint did not return this project; its ID will be used as the label.")
+      fi
+    fi
+  fi
+
+  acquire_config_lock
+  load_or_default_config
+  existing_project=$(jq -c --arg id "$requested_project" '.projects[] | select(.id == $id)' <<<"$config_json" || true)
+  if [[ $metadata_permission != ok && -n $existing_project ]]; then
+    project_name=$(jq -r '.name // .id' <<<"$existing_project")
+    icon_url=""
+    (( metadata_fetched_at > 0 )) || metadata_fetched_at=$(jq -r '.metadataFetchedAt // 0' <<<"$existing_project")
+  fi
+  if read_key "$requested_project"; then
+    old_key=$api_key
+    had_old_key=true
+    unset api_key
+  fi
+  if ! printf '%s' "$key" | secret-tool store \
+    --label="Pulse for RevenueCat · $project_name" \
+    service "$service_name" project "$requested_project"; then
+    unset key old_key
+    release_config_lock
+    fail "Could not store the RevenueCat key; configuration was not changed"
+  fi
+
+  updated=$(upsert_project "$config_json" "$requested_project" "$project_name" "$icon_url" "$metadata_permission" "$metadata_fetched_at")
+  if ! write_config "$updated"; then
+    rollback_ok=true
+    if [[ $had_old_key == true ]]; then
+      if ! printf '%s' "$old_key" | secret-tool store \
+        --label="Pulse for RevenueCat · $project_name" \
+        service "$service_name" project "$requested_project" >/dev/null; then
+        rollback_ok=false
+      fi
+    else
+      clear_secret_verified "$requested_project" || rollback_ok=false
+    fi
+    unset key old_key
+    release_config_lock
+    if [[ $rollback_ok == true ]]; then
+      fail "Could not save RevenueCat configuration; the key change was rolled back"
+    fi
+    fail "Could not save RevenueCat configuration and could not restore the previous key; reconnect this project before using it"
+  fi
+  config_json=$updated
+  if (( retry_after_at > 0 )) && ! persist_retry_deadline "$requested_project" "$retry_after_at"; then
+    unset key old_key
+    release_config_lock
+    fail "The project was connected, but its rate-limit deadline could not be saved; wait before refreshing it"
+  fi
+  unset key old_key
+  release_config_lock
+
+  printf 'Connected %s (%s).\n' "$project_name" "$requested_project"
+  if [[ $(jq 'length' <<<"$issues") -gt 0 ]]; then
+    printf 'The project was saved with these warnings:\n' >&2
+    jq -r '.[] | "  - " + .message' <<<"$issues" >&2
+    printf 'Create or update the key with these read-only permissions:\n' >&2
+    printf '  - project_configuration:projects:read\n  - charts_metrics:overview:read\n  - charts_metrics:charts:read\n' >&2
+  else
+    printf 'All required read permissions are available.\n'
+  fi
+}
+
+remove_project() {
+  require_tools
+  load_config || fail "RevenueCat is not configured"
+  local project_id=${1:-} project_name updated answer
+  if [[ -z $project_id ]]; then
+    read -r -p 'Project ID to remove: ' project_id
+  fi
+  valid_project_id "$project_id" || fail "Invalid project ID"
+  project_name=$(jq -r --arg id "$project_id" '.projects[] | select(.id == $id) | .name' <<<"$config_json")
+  [[ -n $project_name ]] || fail "Project is not configured: $project_id"
+  read -r -p "Remove $project_name and its stored key? [y/N] " answer
+  [[ $answer == y || $answer == Y ]] || { printf 'Cancelled.\n'; return; }
+
+  acquire_config_lock
+  if ! load_config; then
+    release_config_lock
+    printf 'RevenueCat configuration changed or became invalid; nothing was removed.\n' >&2
+    return 1
+  fi
+  project_name=$(jq -r --arg id "$project_id" '.projects[] | select(.id == $id) | .name' <<<"$config_json")
+  if [[ -z $project_name ]]; then
+    release_config_lock
+    printf 'Project is no longer configured: %s\n' "$project_id" >&2
+    return 1
+  fi
+  if ! clear_secret_verified "$project_id"; then
+    release_config_lock
+    printf 'Could not delete the stored key for %s; project configuration and caches were retained.\n' "$project_id" >&2
+    return 1
+  fi
+  updated=$(jq -c --arg id "$project_id" '
+    .projects |= map(select(.id != $id))
+    | if .selectedProject == $id then .selectedProject = "all" else . end
+  ' <<<"$config_json")
+  local cache_path
+  cache_path=$(project_cache_file "$project_id")
+  if ! write_config "$updated"; then
+    release_config_lock
+    printf 'The stored key was deleted, but project configuration could not be updated; the project was retained and should be reconnected before use.\n' >&2
+    return 1
+  fi
+  if ! rm -f -- "$cache_path" "$(project_retry_file "$project_id")" "$cache_file"; then
+    release_config_lock
+    printf 'The project and key were removed, but cached data could not be fully deleted.\n' >&2
+    return 1
+  fi
+  release_config_lock
+  printf 'Removed %s.\n' "$project_name"
+}
+
+toggle_project() {
+  local project_id=${1:-} updated
+  [[ -n $project_id ]] || { read -r -p 'Project ID to include/exclude: ' project_id; }
+  valid_project_id "$project_id" || fail "Invalid project ID"
+  acquire_config_lock
+  if ! load_config; then
+    release_config_lock
+    fail "RevenueCat is not configured"
+  fi
+  jq -e --arg id "$project_id" '.projects[] | select(.id == $id)' <<<"$config_json" >/dev/null || fail "Project is not configured: $project_id"
+  updated=$(jq -c --arg id "$project_id" '.projects |= map(if .id == $id then .enabled = (.enabled | not) else . end)' <<<"$config_json")
+  write_config "$updated"
+  release_config_lock
+  jq -r --arg id "$project_id" '.projects[] | select(.id == $id) | .name + (if .enabled then " is included in totals." else " is excluded from totals." end)' <<<"$updated"
+}
+
+list_projects() {
+  require_tools
+  if ! load_config; then
+    printf 'No projects configured.\n'
+    return
+  fi
+  local project_id has_key
+  while IFS= read -r project_id; do
+    has_key=false
+    read_key "$project_id" && has_key=true
+    unset api_key 2>/dev/null || true
+    jq -r --arg id "$project_id" --argjson hasKey "$has_key" '
+      .projects[] | select(.id == $id) |
+      "- " + .name + " (" + .id + ") · "
+      + (if .enabled then "included" else "excluded" end)
+      + (if $hasKey then " · key stored" else " · key missing" end)
+    ' <<<"$config_json"
+  done < <(jq -r '.projects[].id' <<<"$config_json")
+}
+
+manage() {
+  require_tools
+  while true; do
+    printf '\nPulse for RevenueCat\n\n'
+    list_projects
+    printf '\n[a] Add/reconnect  [r] Remove  [t] Include/exclude  [q] Done\n'
+    read -r -p '> ' action
+    case $action in
+      a|A) configure_project ;;
+      r|R)
+        # Run removal in a child so Bash does not disable errexit throughout
+        # remove_project merely because the manager wants to catch its status.
+        if ! "$0" project remove; then
+          printf 'Project was not removed.\n'
+        fi
+        ;;
+      t|T) toggle_project ;;
+      q|Q|'') break ;;
+      *) printf 'Unknown choice.\n' ;;
+    esac
+  done
+}
+
+settings() {
+  local key=${1:-} value=${2:-} updated
+  [[ -n $key && -n $value ]] || fail "Expected: settings NAME VALUE"
+  acquire_config_lock
+  load_or_default_config
+  case $key in
+    refresh-minutes)
+      [[ $value =~ ^(15|30|60|180|360)$ ]] || fail "Refresh must be 15, 30, 60, 180, or 360 minutes"
+      updated=$(jq -c --argjson value "$value" '.refreshMinutes = $value' <<<"$config_json")
+      ;;
+    bar-metric)
+      [[ $value == mrr || $value == revenue ]] || fail "Bar metric must be mrr or revenue"
+      updated=$(jq -c --arg value "$value" '.barMetric = $value' <<<"$config_json")
+      ;;
+    bar-scope)
+      [[ $value == all || $value == selected ]] || fail "Bar scope must be all or selected"
+      updated=$(jq -c --arg value "$value" '.barScope = $value' <<<"$config_json")
+      ;;
+    selected-project)
+      if [[ $value != all ]]; then
+        valid_project_id "$value" || fail "Invalid project ID"
+        jq -e --arg id "$value" '.projects[] | select(.id == $id)' <<<"$config_json" >/dev/null || fail "Unknown project: $value"
+      fi
+      updated=$(jq -c --arg value "$value" '.selectedProject = $value' <<<"$config_json")
+      ;;
+    expanded-metric)
+      valid_metric "$value" || fail "Unknown metric: $value"
+      updated=$(jq -c --arg value "$value" '.expandedMetric = $value' <<<"$config_json")
+      ;;
+    currency)
+      value=${value^^}
+      valid_currency "$value" || fail "Currency must be a three-letter code such as USD or EUR"
+      updated=$(jq -c --arg value "$value" '.currency = $value' <<<"$config_json")
+      ;;
+    *) fail "Unknown setting: $key" ;;
+  esac
+  if [[ $updated != "$config_json" || $config_needs_write == true ]]; then
+    write_config "$updated"
+  fi
+  release_config_lock
+  printf 'Saved %s.\n' "$key"
+}
+
+settings_manager() {
+  local action choice metric scope interval currency interval_label
+  while true; do
+    load_or_default_config
+    metric=$(jq -r '.barMetric' <<<"$config_json")
+    scope=$(jq -r '.barScope' <<<"$config_json")
+    interval=$(jq -r '.refreshMinutes' <<<"$config_json")
+    currency=$(jq -r '.currency' <<<"$config_json")
+    case $interval in
+      60) interval_label='Every hour' ;;
+      180) interval_label='Every 3 hours' ;;
+      360) interval_label='Every 6 hours' ;;
+      *) interval_label="Every $interval minutes" ;;
+    esac
+
+    printf '\nPulse for RevenueCat · Settings\n\n'
+    printf 'Bar metric:      %s\n' "$([[ $metric == mrr ]] && printf 'MRR' || printf 'Revenue · 28 days')"
+    printf 'Bar scope:       %s\n' "$([[ $scope == all ]] && printf 'All projects' || printf 'Selected view')"
+    printf 'Refresh:         %s\n' "$interval_label"
+    printf 'Currency:        %s\n' "$currency"
+    printf '\n[m] Bar metric  [s] Bar scope  [r] Refresh interval  [c] Currency  [q] Done\n'
+    read -r -p '> ' action || return
+
+    case $action in
+      m|M)
+        printf '\n[1] MRR  [2] Revenue · 28 days\n'
+        read -r -p '> ' choice || return
+        case $choice in
+          1) settings bar-metric mrr ;;
+          2) settings bar-metric revenue ;;
+          *) printf 'No change.\n' ;;
+        esac
+        ;;
+      s|S)
+        printf '\n[1] All projects  [2] Selected dashboard view\n'
+        read -r -p '> ' choice || return
+        case $choice in
+          1) settings bar-scope all ;;
+          2) settings bar-scope selected ;;
+          *) printf 'No change.\n' ;;
+        esac
+        ;;
+      r|R)
+        printf '\n[1] 15 minutes  [2] 30 minutes  [3] 1 hour  [4] 3 hours  [5] 6 hours\n'
+        read -r -p '> ' choice || return
+        case $choice in
+          1) settings refresh-minutes 15 ;;
+          2) settings refresh-minutes 30 ;;
+          3) settings refresh-minutes 60 ;;
+          4) settings refresh-minutes 180 ;;
+          5) settings refresh-minutes 360 ;;
+          *) printf 'No change.\n' ;;
+        esac
+        ;;
+      c|C)
+        read -r -p 'Three-letter display currency (for example USD or EUR): ' choice || return
+        if valid_currency "${choice^^}"; then
+          settings currency "$choice"
+        else
+          printf 'No change; enter a three-letter currency code.\n'
+        fi
+        ;;
+      q|Q|'') return ;;
+      *) printf 'Unknown choice.\n' ;;
+    esac
+  done
+}
+
+status() {
+  require_tools
+  if ! load_config; then
+    jq -cn '{configured:false,projectCount:0,projects:[],currency:"USD",refreshMinutes:60,barMetric:"mrr",barScope:"all"}'
+    return
+  fi
+  local projects='[]' project_id has_key public_project
+  while IFS= read -r public_project; do
+    project_id=$(jq -r '.id' <<<"$public_project")
+    has_key=false
+    read_key "$project_id" && has_key=true
+    unset api_key 2>/dev/null || true
+    projects=$(jq -c --argjson project "$public_project" --argjson hasKey "$has_key" '. + [($project + {hasKey:$hasKey})]' <<<"$projects")
+  done < <(jq -c '.projects[]' <<<"$config_json")
+  jq -cn --argjson config "$config_json" --argjson projects "$projects" '{
+    configured: (($projects | length) > 0),
+    projectCount: ($projects | length),
+    projects: $projects,
+    currency: $config.currency,
+    refreshMinutes: $config.refreshMinutes,
+    selectedProject: $config.selectedProject,
+    barMetric: $config.barMetric,
+    barScope: $config.barScope,
+    expandedMetric: $config.expandedMetric
+  }'
+}
+
+logout() {
+  require_tools
+  acquire_config_lock
+  if ! clear_all_secrets_verified; then
+    release_config_lock
+    printf 'Could not delete every RevenueCat credential; configuration and caches were retained for a safe retry.\n' >&2
+    return 1
+  fi
+  if ! rm -f -- "$config_file" "$cache_file"; then
+    release_config_lock
+    printf 'Credentials were deleted, but local RevenueCat state could not be fully removed.\n' >&2
+    return 1
+  fi
+  if [[ -d $projects_cache_dir ]]; then
+    if ! find "$projects_cache_dir" -type f -name '*.json' -delete; then
+      release_config_lock
+      printf 'Credentials were deleted, but cached RevenueCat project data could not be fully removed.\n' >&2
+      return 1
+    fi
+    rmdir "$projects_cache_dir" 2>/dev/null || true
+  fi
+  release_config_lock
+  # Keep the lock inode persistent. Unlinking it after unlock lets a process
+  # already waiting on the old inode overlap a new process locking a new inode.
+  rmdir "$cache_dir" 2>/dev/null || true
+  printf 'RevenueCat credentials and cached metrics removed.\n'
+}
+
+usage() {
+  cat <<'EOF'
+Usage: revenuecat-control COMMAND
+
+Commands:
+  configure [PROJECT_ID]                 Add or reconnect one project
+  configure-hold [PROJECT_ID]            Configure, then wait before closing a GUI terminal
+  manage                                 Add, remove, reconnect, or include/exclude projects
+  manage-hold                            Manage, then wait before closing a GUI terminal
+  settings-manage                        Configure display and refresh behavior
+  settings-manage-hold                   Configure settings, then wait before closing
+  project list                           List configured projects
+  project add [PROJECT_ID]               Add or reconnect a project
+  project remove [PROJECT_ID]            Remove a project and its key
+  project toggle [PROJECT_ID]            Include/exclude a project from totals
+  settings NAME VALUE                    Change refresh, bar, view, or currency settings
+  cached                                 Print the last sanitized snapshot without network access
+  fetch [PROJECT_ID ...]                 Refresh all or selected projects and print normalized metrics
+  demo                                   Print representative multi-project demo metrics
+  status                                 Show configuration state without revealing keys
+  logout                                 Remove every key, configuration, and cached metric
+EOF
+}
+
+case ${1:-} in
+  configure) shift; configure_project "$@" ;;
+  configure-hold)
+    shift
+    configure_project "$@" || true
+    printf '\nPress Enter to close…'
+    read -r _
+    ;;
+  manage) shift; manage "$@" ;;
+  manage-hold)
+    shift
+    manage "$@"
+    printf '\nPress Enter to close…'
+    read -r _
+    ;;
+  settings-manage) shift; settings_manager "$@" ;;
+  settings-manage-hold)
+    shift
+    settings_manager "$@"
+    printf '\nPress Enter to close…'
+    read -r _
+    ;;
+  project)
+    shift
+    case ${1:-} in
+      list) shift; list_projects "$@" ;;
+      add) shift; configure_project "$@" ;;
+      remove) shift; remove_project "$@" ;;
+      toggle) shift; toggle_project "$@" ;;
+      *) fail "Expected: project list, add, remove, or toggle" ;;
+    esac
+    ;;
+  settings) shift; settings "$@" ;;
+  cached) cached_snapshot ;;
+  fetch) shift; fetch_metrics "$@" ;;
+  demo) demo ;;
+  status) status ;;
+  logout) logout ;;
+  help|-h|--help|'') usage ;;
+  *) fail "Unknown command: $1" ;;
+esac

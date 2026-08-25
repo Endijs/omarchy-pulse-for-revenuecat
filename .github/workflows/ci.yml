@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install static analysis dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq shellcheck
+      - name: Validate shell syntax
+        run: bash -n revenuecat-control tests/run.sh tests/fake-bin/curl tests/fake-bin/mktemp tests/fake-bin/secret-tool
+      - name: Run ShellCheck
+        run: shellcheck revenuecat-control tests/run.sh tests/fake-bin/curl tests/fake-bin/mktemp tests/fake-bin/secret-tool
+      - name: Run regression tests
+        run: ./tests/run.sh
+      - name: Validate manifest JSON
+        run: jq -e '.schemaVersion == 1 and (.entryPoints | type == "object")' manifest.json >/dev/null

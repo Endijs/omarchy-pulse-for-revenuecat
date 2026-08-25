@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ ${FAKE_CONFIG_WRITE_FAIL:-0} == 1 && " $* " == *'/.config.'* ]]; then
+  exit 1
+fi
+exec /usr/bin/mktemp "$@"
