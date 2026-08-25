@@ -121,10 +121,10 @@ FAKE_CHART_POINT_COUNT=29 "$helper" fetch two >"$test_root/excessive-chart.json"
 assert_jq "$test_root/excessive-chart.json" '.projects[] | select(.id == "two") | .stale == true and any(.issues[]; .code == "invalid_chart") and ([.charts[] | length <= 28] | all)' \
   'oversized chart array was accepted by normalization'
 
-oversized_projects=$(jq -cn '{items:
+oversized_projects=$(jq -cn '{items: (
   [{id:"metadata-limit",name:"Metadata Limit"}]
   + [range(0; 100) | {id:("extra_" + (tostring)),name:"Extra"}]
-}')
+)}')
 : >"$FAKE_CURL_LOG"
 printf 'sk_metadata_limit\n' | FAKE_PROJECTS_JSON=$oversized_projects \
   "$helper" configure metadata-limit >/dev/null 2>"$test_root/metadata-limit.err"
