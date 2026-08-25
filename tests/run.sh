@@ -213,6 +213,8 @@ assert_jq "$test_root/demo.json" '
   and [.projects[].name] == ["Orbit Notes","Tiny Habits","Focus Garden"]
   and ([.projects[].charts[] | length == 28] | all)
 ' 'demo snapshot is missing its synthetic projects or complete chart series'
+# The dollar-prefixed names below are jq variables, not shell expansions.
+# shellcheck disable=SC2016
 assert_jq "$test_root/demo.json" '
   [.projects[]
     | ((.metrics.revenue.value - ([.charts.revenue[].value] | add)) as $difference
@@ -223,6 +225,8 @@ assert_jq "$test_root/demo.json" '
     and .metrics.new_customers.value == ([.charts.new_customers[].value] | add)
   ] | all
 ' 'demo overview metrics disagree with their chart series'
+# The dollar-prefixed names below are jq variables, not shell expansions.
+# shellcheck disable=SC2016
 assert_jq "$test_root/demo.json" '
   [.totals.charts[]
     | . as $points
