@@ -13,9 +13,22 @@ config_file=$config_dir/config.json
 cache_file=$cache_dir/metrics.json
 config_lock_file=$config_dir/.config.lock
 
-snapshot_schema_version=3
+snapshot_schema_version=4
+project_cache_schema_version=1
 metadata_ttl_seconds=86400
 max_parallel_projects=3
+max_response_bytes=1048576
+max_response_file_kib=1024
+max_header_bytes=131072
+max_metadata_items=100
+max_overview_metrics=64
+max_chart_values=256
+max_chart_points=28
+max_retry_after_seconds=86400
+max_retry_cache_bytes=4096
+max_project_cache_bytes=262144
+max_snapshot_base_bytes=262144
+max_snapshot_per_project_bytes=524288
 
 cleanup_dirs=()
 config_lock_held=false
@@ -68,9 +81,24 @@ fail() {
 
 require_tools() {
   local tool
-  for tool in curl flock jq secret-tool; do
+  for tool in curl flock jq secret-tool stat; do
     command -v "$tool" >/dev/null 2>&1 || fail "Missing dependency: $tool"
   done
+}
+
+file_size_within_limit() {
+  local file=$1 limit=$2 size
+  [[ -f $file ]] || return 1
+  size=$(stat -c %s -- "$file") || return 1
+  [[ $size =~ ^[0-9]+$ ]] && (( size <= limit ))
+}
+
+snapshot_cache_byte_limit() {
+  local config=$1 project_count
+  project_count=$(jq -r 'if (.projects | type) == "array" then (.projects | length) else 0 end' \
+    <<<"$config" 2>/dev/null || printf 0)
+  [[ $project_count =~ ^[0-9]+$ ]] || project_count=0
+  printf '%s\n' "$(( max_snapshot_base_bytes + project_count * max_snapshot_per_project_bytes ))"
 }
 
 valid_project_id() {
@@ -273,11 +301,14 @@ project_data_config() {
 project_result_compatible() {
   local file=$1 project_id=$2 currency=$3 revenue_type=$4
   [[ -s $file ]] || return 1
+  file_size_within_limit "$file" "$max_project_cache_bytes" || return 1
   jq -e \
     --arg id "$project_id" \
     --arg currency "$currency" \
-    --arg revenueType "$revenue_type" '
-      .id == $id
+    --arg revenueType "$revenue_type" \
+    --argjson cacheVersion "$project_cache_schema_version" '
+      .cacheVersion == $cacheVersion
+      and .id == $id
       and .dataConfig.currency == $currency
       and .dataConfig.revenueType == $revenueType
       and (.metrics | objects)
@@ -285,19 +316,16 @@ project_result_compatible() {
     ' "$file" >/dev/null 2>&1
 }
 
+project_cache_compatible() {
+  local file=$1
+  project_result_compatible "$@" && jq -e '.ok == true' "$file" >/dev/null 2>&1
+}
+
 project_retry_blocked() {
-  local project_id=$1 cache_path retry_path now_ms
-  cache_path=$(project_cache_file "$project_id")
-  retry_path=$(project_retry_file "$project_id")
+  local project_id=$1 now_ms deadline
   now_ms=$(date +%s%3N)
-  if [[ -s $retry_path ]] && jq -e --arg id "$project_id" --argjson now "$now_ms" '
-      .id == $id and ((.retryAfterAt // 0) | tonumber? // 0) > $now
-    ' "$retry_path" >/dev/null 2>&1; then
-    return 0
-  fi
-  [[ -s $cache_path ]] && jq -e --arg id "$project_id" --argjson now "$now_ms" '
-      .id == $id and ((.retryAfterAt // 0) | tonumber? // 0) > $now
-    ' "$cache_path" >/dev/null 2>&1
+  deadline=$(retry_deadline "$project_id")
+  (( deadline > now_ms ))
 }
 
 project_retry_file() {
@@ -305,24 +333,40 @@ project_retry_file() {
 }
 
 retry_deadline() {
-  local project_id=$1 retry_path cache_path deadline=0 candidate
+  local project_id=$1 retry_path cache_path deadline=0 path candidate modified_at max_allowed file_limit now_max
   retry_path=$(project_retry_file "$project_id")
   cache_path=$(project_cache_file "$project_id")
-  for candidate in "$retry_path" "$cache_path"; do
-    [[ -s $candidate ]] || continue
+  now_max=$(( ($(date +%s) + max_retry_after_seconds) * 1000 ))
+  for path in "$retry_path" "$cache_path"; do
+    [[ -s $path ]] || continue
+    if [[ $path == "$retry_path" ]]; then
+      file_limit=$max_retry_cache_bytes
+    else
+      file_limit=$max_project_cache_bytes
+    fi
+    file_size_within_limit "$path" "$file_limit" || continue
     candidate=$(jq -r --arg id "$project_id" '
       if .id == $id then ((.retryAfterAt // 0) | tonumber? // 0) else 0 end
-    ' "$candidate" 2>/dev/null || printf 0)
+    ' "$path" 2>/dev/null || printf 0)
     [[ $candidate =~ ^[0-9]+$ ]] || candidate=0
+    modified_at=$(stat -c %Y -- "$path" 2>/dev/null || printf 0)
+    [[ $modified_at =~ ^[0-9]+$ ]] || modified_at=0
+    max_allowed=$(( (modified_at + max_retry_after_seconds) * 1000 ))
+    # Reject legacy poisoned values instead of clamping relative to the current
+    # time on every read, which would create a deadline that never expires.
+    (( candidate <= max_allowed && candidate <= now_max )) || candidate=0
     (( candidate > deadline )) && deadline=$candidate
   done
   printf '%s\n' "$deadline"
 }
 
 persist_retry_deadline() {
-  local project_id=$1 candidate=$2 retry_path current updated temp
+  local project_id=$1 candidate=$2 retry_path current updated temp now_epoch max_allowed
   [[ $candidate =~ ^[0-9]+$ ]] || return 0
   (( candidate > 0 )) || return 0
+  now_epoch=$(date +%s)
+  max_allowed=$(( (now_epoch + max_retry_after_seconds) * 1000 ))
+  (( candidate <= max_allowed )) || candidate=$max_allowed
   retry_path=$(project_retry_file "$project_id")
   current=$(retry_deadline "$project_id")
   (( candidate > current )) || return 0
@@ -347,6 +391,64 @@ write_json_file_atomic() {
   mv -- "$temp" "$target"
 }
 
+clear_retry_deadline() {
+  local project_id=$1 retry_path project_cache temp snapshot_limit
+  retry_path=$(project_retry_file "$project_id")
+  project_cache=$(project_cache_file "$project_id")
+  rm -f -- "$retry_path" || return 1
+
+  if [[ -s $project_cache ]]; then
+    if ! file_size_within_limit "$project_cache" "$max_project_cache_bytes"; then
+      rm -f -- "$project_cache" || return 1
+    else
+      new_work_dir temp
+      if jq -e --arg id "$project_id" '
+          if type == "object" and .id == $id then .retryAfterAt = 0 else empty end
+        ' "$project_cache" >"$temp/project-cache.json" 2>/dev/null; then
+        write_json_file_atomic "$project_cache" "$temp/project-cache.json" || return 1
+      fi
+    fi
+  fi
+
+  if [[ -s $cache_file ]]; then
+    snapshot_limit=$max_snapshot_base_bytes
+    [[ -z ${config_json:-} ]] || snapshot_limit=$(snapshot_cache_byte_limit "$config_json")
+    if ! file_size_within_limit "$cache_file" "$snapshot_limit"; then
+      rm -f -- "$cache_file" || return 1
+    else
+      new_work_dir temp
+      if jq -e --arg id "$project_id" '
+          if type == "object" and (.projects | type) == "array" then
+            .projects |= map(if .id == $id then .retryAfterAt = 0 else . end)
+          else empty end
+        ' "$cache_file" >"$temp/global-cache.json" 2>/dev/null; then
+        write_json_file_atomic "$cache_file" "$temp/global-cache.json" || return 1
+      fi
+    fi
+  fi
+}
+
+prune_oversized_caches_unlocked() {
+  local config=$1 project_id project_cache retry_cache snapshot_limit
+  [[ $config_lock_held == true ]] || fail "Internal error: cache pruning without lock"
+  while IFS= read -r project_id; do
+    valid_project_id "$project_id" || continue
+    project_cache=$(project_cache_file "$project_id")
+    retry_cache=$(project_retry_file "$project_id")
+    if [[ -e $project_cache ]] && ! file_size_within_limit "$project_cache" "$max_project_cache_bytes"; then
+      rm -f -- "$project_cache" || return 1
+    fi
+    if [[ -e $retry_cache ]] && ! file_size_within_limit "$retry_cache" "$max_retry_cache_bytes"; then
+      rm -f -- "$retry_cache" || return 1
+    fi
+  done < <(jq -r '.projects[].id' <<<"$config")
+
+  snapshot_limit=$(snapshot_cache_byte_limit "$config")
+  if [[ -e $cache_file ]] && ! file_size_within_limit "$cache_file" "$snapshot_limit"; then
+    rm -f -- "$cache_file" || return 1
+  fi
+}
+
 api_request() {
   local key=$1 url=$2 output=$3 curl_status headers retry_after retry_epoch escaped_key retry_seconds now_epoch
   headers=$output.headers
@@ -364,21 +466,48 @@ api_request() {
       'retry = 1' \
       'retry-delay = 1' \
       'retry-max-time = 5'
-  } | curl -q --config - --proto '=https' --url "$url" --output "$output" --dump-header "$headers" --write-out '%{http_code}') || curl_status=$?
+  } | (
+    # Bash applies this limit to every file written by curl, including the
+    # separate dump-header file. --max-filesize adds an exact body limit and
+    # the resource limit also covers chunked or otherwise unknown lengths.
+    ulimit -c 0
+    ulimit -f "$max_response_file_kib"
+    trap '' XFSZ
+    exec curl -q --config - --proto '=https' --max-filesize "$max_response_bytes" \
+      --url "$url" --output "$output" --dump-header "$headers" --write-out '%{http_code}'
+  )) || curl_status=$?
   if (( curl_status != 0 )); then
     API_HTTP_STATUS=000
+    rm -f -- "$output" "$headers"
+    return 1
+  fi
+
+  if ! file_size_within_limit "$output" "$max_response_bytes" \
+    || ! file_size_within_limit "$headers" "$max_header_bytes"; then
+    API_HTTP_STATUS=000
+    rm -f -- "$output" "$headers"
     return 1
   fi
 
   retry_after=$(awk -F: 'tolower($1) == "retry-after" {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0} END {print value}' "$headers" 2>/dev/null || true)
+  rm -f -- "$headers"
   now_epoch=$(date +%s)
   if [[ $retry_after =~ ^[0-9]{1,10}$ ]]; then
     retry_seconds=$(( 10#$retry_after ))
+    (( retry_seconds <= max_retry_after_seconds )) || retry_seconds=$max_retry_after_seconds
     API_RETRY_AFTER_AT=$(( (now_epoch + retry_seconds) * 1000 ))
   elif [[ -n $retry_after ]] && retry_epoch=$(date -d "$retry_after" +%s 2>/dev/null); then
-    (( retry_epoch > now_epoch )) && API_RETRY_AFTER_AT=$(( retry_epoch * 1000 ))
+    if (( retry_epoch > now_epoch )); then
+      retry_seconds=$(( retry_epoch - now_epoch ))
+      (( retry_seconds <= max_retry_after_seconds )) || retry_seconds=$max_retry_after_seconds
+      API_RETRY_AFTER_AT=$(( (now_epoch + retry_seconds) * 1000 ))
+    fi
   fi
-  [[ $API_HTTP_STATUS =~ ^2[0-9][0-9]$ ]]
+  if [[ $API_HTTP_STATUS =~ ^2[0-9][0-9]$ ]]; then
+    return 0
+  fi
+  rm -f -- "$output"
+  return 1
 }
 
 stop_after_request_failure() {
@@ -436,7 +565,7 @@ project_cache_file() {
 discover_metadata() {
   local key=$1 project_id=$2 output=$3 normalized=$4
   if api_request "$key" 'https://api.revenuecat.com/v2/projects?limit=100' "$output"; then
-    jq -ce --arg id "$project_id" '
+    if jq -ce --arg id "$project_id" --argjson maxItems "$max_metadata_items" '
       def safe_text($fallback):
         if type != "string" then $fallback else
           gsub("[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"; "")
@@ -447,10 +576,22 @@ discover_metadata() {
           | .[0:80]
           | if length > 0 then . else $fallback end
         end;
-      .items[]? | select(.id == $id) | . as $item |
-      {name:(($item.name // $item.id) | safe_text($item.id)),iconUrl:""}
-    ' "$output" >"$normalized" 2>/dev/null || return 2
-    return 0
+      if (.items | type) != "array" or (.items | length) > $maxItems then
+        error("invalid projects response")
+      else
+        [.items[] | select(.id == $id)] as $matches
+        | if ($matches | length) == 1 then
+            $matches[0] as $item
+            | {name:(($item.name // $item.id) | safe_text($item.id)),iconUrl:""}
+          else empty
+          end
+      end
+    ' "$output" >"$normalized" 2>/dev/null; then
+      rm -f -- "$output"
+      return 0
+    fi
+    rm -f -- "$output" "$normalized"
+    return 2
   fi
   return 1
 }
@@ -466,30 +607,49 @@ chart_url() {
 }
 
 normalize_chart() {
-  jq -c '[
-    .values[]?
-    | select((.measure // 0) == 0)
-    | {
-        at: (.cohort | tonumber),
-        value: (.value | tonumber? // 0),
-        incomplete: (.incomplete == true)
-      }
-  ] | sort_by(.at)' "$1"
+  jq -ce --argjson maxValues "$max_chart_values" --argjson maxPoints "$max_chart_points" '
+    if (.values | type) != "array" or (.values | length) > $maxValues then
+      error("invalid chart response")
+    else
+      [
+        .values[]
+        | select((.measure // 0) == 0)
+        | {
+            at: (.cohort | tonumber),
+            value: (.value | tonumber? // 0),
+            incomplete: (.incomplete == true)
+          }
+      ] as $points
+      | if ($points | length) > $maxPoints then
+          error("invalid chart response")
+        else $points | sort_by(.at)
+        end
+    end
+  ' "$1" 2>/dev/null
 }
 
 normalize_metrics() {
-  jq -c '
-    reduce (.metrics[]?) as $metric ({};
-      .[$metric.id] = {
-        id: $metric.id,
-        name: ($metric.name // $metric.id),
-        value: ($metric.value | tonumber? // 0),
-        unit: ($metric.unit // ""),
-        period: ($metric.period // ""),
-        lastUpdatedAt: ($metric.last_updated_at // 0)
-      }
-    )
-  ' "$1"
+  jq -ce --argjson maxMetrics "$max_overview_metrics" '
+    def wanted:
+      . == "mrr" or . == "revenue" or . == "active_subscriptions"
+      or . == "active_trials" or . == "new_customers" or . == "active_users";
+    def bounded_text($fallback; $limit):
+      if type == "string" then .[0:$limit] else $fallback end;
+    if (.metrics | type) != "array" or (.metrics | length) > $maxMetrics then
+      error("invalid overview response")
+    else
+      reduce (.metrics[] | select((.id | type) == "string" and (.id | wanted))) as $metric ({};
+        .[$metric.id] = {
+          id: $metric.id,
+          name: (($metric.name // $metric.id) | bounded_text($metric.id; 80)),
+          value: ($metric.value | tonumber? // 0),
+          unit: (($metric.unit // "") | bounded_text(""; 16)),
+          period: (($metric.period // "") | bounded_text(""; 32)),
+          lastUpdatedAt: ($metric.last_updated_at | tonumber? // 0)
+        }
+      )
+    end
+  ' "$1" 2>/dev/null
 }
 
 process_project() {
@@ -514,7 +674,7 @@ process_project() {
 
   if ! read_key "$project_id"; then
     issues=$(append_issue "$issues" error missing_key "" "$project_name: no API key is stored. Reconnect this project.")
-    if project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+    if project_cache_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
       metrics=$(jq -c '.metrics // {}' "$cache_path")
       charts=$(jq -c '.charts // {}' "$cache_path")
       fetched_at=$(jq -r '.fetchedAt // 0' "$cache_path")
@@ -525,11 +685,12 @@ process_project() {
     permissions=$(jq -cn '{projects:"unknown",overview:"unknown",charts:"unknown"}')
     jq -cn \
       --arg id "$project_id" --arg name "$project_name" --arg iconUrl "$icon_url" \
+      --argjson cacheVersion "$project_cache_schema_version" \
       --argjson enabled "$enabled" --argjson ok "$ok" --argjson stale "$stale" \
       --argjson fetchedAt "$fetched_at" --argjson metrics "$metrics" --argjson charts "$charts" \
       --argjson permissions "$permissions" --argjson issues "$issues" --argjson dataConfig "$data_context" \
       --argjson metadataFetchedAt "$metadata_fetched_at" --argjson retryAfterAt "$retry_after_at" \
-      '{id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
+      '{cacheVersion:$cacheVersion,id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
       >"$result_file"
     return
   fi
@@ -547,6 +708,7 @@ process_project() {
     metadata_fetched_at=$now_ms
     if discover_metadata "$key" "$project_id" "$metadata_file" "$metadata_normalized"; then
       metadata_json=$(<"$metadata_normalized")
+      rm -f -- "$metadata_normalized"
       project_name=$(jq -r '.name' <<<"$metadata_json")
       icon_url=$(jq -r '.iconUrl' <<<"$metadata_json")
       metadata_status=ok
@@ -567,8 +729,7 @@ process_project() {
   if [[ $skip_remaining_requests == false ]]; then
     overview_file=$work_dir/$project_id-overview.json
     if api_request "$key" "https://api.revenuecat.com/v2/projects/$project_id/metrics/overview?currency=$currency" "$overview_file"; then
-      if jq -e '.metrics | arrays' "$overview_file" >/dev/null 2>&1; then
-        metrics=$(normalize_metrics "$overview_file")
+      if metrics=$(normalize_metrics "$overview_file"); then
         overview_status=ok
         ok=true
         fetched_at=$(date +%s%3N)
@@ -576,6 +737,7 @@ process_project() {
         overview_status=error
         issues=$(append_issue "$issues" warning invalid_response "" "$project_name: RevenueCat returned an unexpected overview response.")
       fi
+      rm -f -- "$overview_file"
     else
       overview_status=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
       (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
@@ -600,6 +762,7 @@ process_project() {
         chart_failed=true
         issues=$(append_issue "$issues" warning invalid_chart "" "$project_name: RevenueCat returned an unexpected $metric_id chart.")
       fi
+      rm -f -- "$chart_file"
     else
       chart_failed=true
       charts_status=$([[ $API_HTTP_STATUS == 403 ]] && printf missing || printf error)
@@ -611,13 +774,13 @@ process_project() {
   done
   unset key
 
-  if [[ $ok != true ]] && project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+  if [[ $ok != true ]] && project_cache_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
     metrics=$(jq -c '.metrics // {}' "$cache_path")
     charts=$(jq -c '.charts // {}' "$cache_path")
     fetched_at=$(jq -r '.fetchedAt // 0' "$cache_path")
     ok=true
     stale=true
-  elif [[ $chart_failed == true ]] && project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+  elif [[ $chart_failed == true ]] && project_cache_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
     local cached_charts
     cached_charts=$(jq -c '.charts // {}' "$cache_path")
     charts=$(jq -cn --argjson fresh "$charts" --argjson cached "$cached_charts" '$cached * $fresh')
@@ -632,11 +795,12 @@ process_project() {
 
   jq -cn \
     --arg id "$project_id" --arg name "$project_name" --arg iconUrl "$icon_url" \
+    --argjson cacheVersion "$project_cache_schema_version" \
     --argjson enabled "$enabled" --argjson ok "$ok" --argjson stale "$stale" \
     --argjson fetchedAt "$fetched_at" --argjson metrics "$metrics" --argjson charts "$charts" \
     --argjson permissions "$permissions" --argjson issues "$issues" --argjson dataConfig "$data_context" \
     --argjson metadataFetchedAt "$metadata_fetched_at" --argjson retryAfterAt "$retry_after_at" \
-    '{id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
+    '{cacheVersion:$cacheVersion,id:$id,name:$name,iconUrl:$iconUrl,enabled:$enabled,ok:$ok,stale:$stale,fetchedAt:$fetchedAt,metadataFetchedAt:$metadataFetchedAt,retryAfterAt:$retryAfterAt,dataConfig:$dataConfig,metrics:$metrics,charts:$charts,permissions:$permissions,issues:$issues}' \
     >"$result_file"
 }
 
@@ -739,7 +903,9 @@ persist_discovered_metadata_unlocked() {
 placeholder_project() {
   local project=$1 currency=$2 revenue_type=$3 data_context
   data_context=$(project_data_config "$currency" "$revenue_type")
-  jq -cn --argjson project "$project" --argjson dataConfig "$data_context" '{
+  jq -cn --argjson project "$project" --argjson dataConfig "$data_context" \
+    --argjson cacheVersion "$project_cache_schema_version" '{
+    cacheVersion: $cacheVersion,
     id: $project.id,
     name: $project.name,
     iconUrl: $project.iconUrl,
@@ -768,7 +934,7 @@ assemble_projects() {
     source_file=""
     if [[ -n $fresh_file ]] && project_result_compatible "$fresh_file" "$project_id" "$currency" "$revenue_type"; then
       source_file=$fresh_file
-    elif project_result_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
+    elif project_cache_compatible "$cache_path" "$project_id" "$currency" "$revenue_type"; then
       source_file=$cache_path
     fi
 
@@ -783,8 +949,7 @@ assemble_projects() {
       item=$(placeholder_project "$project" "$currency" "$revenue_type")
     fi
     retry_after_at=$(retry_deadline "$project_id")
-    item=$(jq -c --argjson retryAfterAt "$retry_after_at" \
-      '.retryAfterAt = ([((.retryAfterAt // 0) | tonumber? // 0), $retryAfterAt] | max)' <<<"$item")
+    item=$(jq -c --argjson retryAfterAt "$retry_after_at" '.retryAfterAt = $retryAfterAt' <<<"$item")
     projects=$(jq -c --argjson item "$item" '. + [$item]' <<<"$projects")
   done < <(jq -c '.projects[]' <<<"$config")
   printf '%s\n' "$projects"
@@ -808,9 +973,24 @@ cached_snapshot() {
     return
   fi
 
-  local expected_data_config projects
+  acquire_config_lock
+  if ! load_config; then
+    release_config_lock
+    local invalid_after_lock
+    invalid_after_lock=$(unconfigured_snapshot)
+    jq -c '.issues = [{severity:"error",code:"invalid_config",permission:"",message:"RevenueCat configuration is invalid; open the terminal manager for details."}]' <<<"$invalid_after_lock"
+    return
+  fi
+  if ! prune_oversized_caches_unlocked "$config_json"; then
+    release_config_lock
+    fail "Unsafe legacy RevenueCat cache files could not be removed"
+  fi
+  release_config_lock
+
+  local expected_data_config projects snapshot_limit
   expected_data_config=$(data_config "$config_json")
-  if [[ -r $cache_file ]] && jq -e \
+  snapshot_limit=$(snapshot_cache_byte_limit "$config_json")
+  if [[ -r $cache_file ]] && file_size_within_limit "$cache_file" "$snapshot_limit" && jq -e \
     --argjson schemaVersion "$snapshot_schema_version" \
     --argjson expected "$expected_data_config" '
       .schemaVersion == $schemaVersion
@@ -921,9 +1101,13 @@ fetch_metrics() {
     result_file=$work_dir/result-$project_id.json
     if [[ -s $result_file ]]; then
       retry_after_at=$(jq -r '((.retryAfterAt // 0) | tonumber? // 0)' "$result_file" 2>/dev/null || printf 0)
-      persist_retry_deadline "$project_id" "$retry_after_at"
+      if (( retry_after_at > 0 )); then
+        persist_retry_deadline "$project_id" "$retry_after_at"
+      else
+        clear_retry_deadline "$project_id"
+      fi
     fi
-    if project_result_compatible "$result_file" "$project_id" "$currency" "$revenue_type"; then
+    if project_cache_compatible "$result_file" "$project_id" "$currency" "$revenue_type"; then
       cache_path=$(project_cache_file "$project_id")
       write_json_file_atomic "$cache_path" "$result_file"
     fi
@@ -1155,6 +1339,7 @@ configure_project() {
 
   if api_request "$key" "https://api.revenuecat.com/v2/projects/$requested_project/metrics/overview?currency=$currency" "$overview_file"; then
     overview_status=ok
+    rm -f -- "$overview_file"
   else
     overview_status=$API_HTTP_STATUS
     (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
@@ -1169,6 +1354,7 @@ configure_project() {
   if [[ $skip_remaining_requests == false ]]; then
     if api_request "$key" "$(chart_url "$requested_project" revenue "$currency" revenue "$start_date" "$end_date")" "$chart_file"; then
       chart_status=ok
+      rm -f -- "$chart_file"
     else
       chart_status=$API_HTTP_STATUS
       (( API_RETRY_AFTER_AT > retry_after_at )) && retry_after_at=$API_RETRY_AFTER_AT
@@ -1181,6 +1367,7 @@ configure_project() {
     metadata_fetched_at=$(date +%s%3N)
     if discover_metadata "$key" "$requested_project" "$metadata_file" "$metadata_normalized"; then
       metadata_json=$(<"$metadata_normalized")
+      rm -f -- "$metadata_normalized"
       project_name=$(jq -r '.name' <<<"$metadata_json")
       icon_url=$(jq -r '.iconUrl' <<<"$metadata_json")
       metadata_permission=ok
@@ -1239,10 +1426,16 @@ configure_project() {
     fail "Could not save RevenueCat configuration and could not restore the previous key; reconnect this project before using it"
   fi
   config_json=$updated
-  if (( retry_after_at > 0 )) && ! persist_retry_deadline "$requested_project" "$retry_after_at"; then
+  if (( retry_after_at > 0 )); then
+    if ! persist_retry_deadline "$requested_project" "$retry_after_at"; then
+      unset key old_key
+      release_config_lock
+      fail "The project was connected, but its rate-limit deadline could not be saved; wait before refreshing it"
+    fi
+  elif ! clear_retry_deadline "$requested_project"; then
     unset key old_key
     release_config_lock
-    fail "The project was connected, but its rate-limit deadline could not be saved; wait before refreshing it"
+    fail "The project was connected, but stale rate-limit state could not be cleared"
   fi
   unset key old_key
   release_config_lock

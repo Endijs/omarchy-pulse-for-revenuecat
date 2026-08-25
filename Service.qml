@@ -9,6 +9,7 @@ Item {
   property var manifest: null
 
   readonly property string helperPath: Qt.resolvedUrl("revenuecat-control").toString().replace(/^file:\/\//, "")
+  readonly property double maxRetryAfterMs: 24 * 60 * 60 * 1000
   property bool loading: true
   property bool bootstrapComplete: false
   property bool demoMode: false
@@ -30,7 +31,7 @@ Item {
   property string barScopeOverride: ""
   property int refreshMinutesOverride: 0
   property var snapshot: ({
-    schemaVersion: 3,
+    schemaVersion: 4,
     configured: false,
     ok: false,
     stale: false,
@@ -212,12 +213,15 @@ Item {
 
   function projectRefreshDue(project) {
     if (!project) return false
+    var now = Date.now()
     var retryAfter = Number(project.retryAfterAt || 0)
     if (retryAfter > 0 && retryAfter < 100000000000) retryAfter *= 1000
-    if (retryAfter > Date.now()) return false
+    // Ignore malformed or legacy cache values outside the same bounded
+    // backoff horizon enforced by the helper.
+    if (isFinite(retryAfter) && retryAfter > now && retryAfter <= now + maxRetryAfterMs) return false
     var lastRefresh = lastRefreshFor(project)
     if (!(lastRefresh > 0)) return true
-    return Date.now() - lastRefresh >= refreshMinutes * 60 * 1000
+    return now - lastRefresh >= refreshMinutes * 60 * 1000
   }
 
   function projectIdsForView(viewId) {
@@ -285,7 +289,7 @@ Item {
     try {
       var parsed = JSON.parse(String(raw || ""))
       var valid = parsed && typeof parsed === "object" && !(parsed instanceof Array)
-        && Number(parsed.schemaVersion) === 3
+        && Number(parsed.schemaVersion) === 4
         && typeof parsed.configured === "boolean" && typeof parsed.ok === "boolean"
         && parsed.settings && typeof parsed.settings === "object" && !(parsed.settings instanceof Array)
         && parsed.projects instanceof Array

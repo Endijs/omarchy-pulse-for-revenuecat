@@ -45,6 +45,7 @@ printf 'sk_two\n' | "$helper" configure two >/dev/null
 config_file=$XDG_CONFIG_HOME/revenue-pulse/config.json
 cache_file=$XDG_CACHE_HOME/revenue-pulse/metrics.json
 project_one_cache=$XDG_CACHE_HOME/revenue-pulse/projects/one.json
+project_two_cache=$XDG_CACHE_HOME/revenue-pulse/projects/two.json
 
 assert_jq "$config_file" '.projects[] | select(.id == "one") | (.name | contains("Café") and contains("😀"))' \
   'legitimate Unicode project-name content was not preserved'
@@ -68,6 +69,133 @@ request_count=$(wc -l <"$FAKE_CURL_LOG")
 ! grep -q '/v2/projects?' "$FAKE_CURL_LOG" || fail_test 'fresh metadata was fetched again before its TTL'
 [[ -f $project_one_cache ]] || fail_test 'project cache was not written'
 [[ -z $(find "$TMPDIR" -mindepth 1 -print -quit) ]] || fail_test 'temporary API workspace was not removed'
+
+# Both curl output files are bounded independently. An oversized transfer must
+# stop at the shared API boundary before jq is invoked or a cache is written.
+: >"$FAKE_CURL_LOG"
+if FAKE_OVERSIZED_OVERVIEW_BODY=1 "$helper" fetch two \
+  >"$test_root/oversized-body.json" 2>"$test_root/oversized-body.err"; then
+  :
+else
+  fail_test 'oversized response body crashed the refresh transaction'
+fi
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 1 ]] || fail_test "oversized body did not stop after one request"
+assert_jq "$test_root/oversized-body.json" '.projects[] | select(.id == "two") | .ok == false and any(.issues[]; .code == "network")' \
+  'oversized body was not handled as a bounded transport failure'
+[[ ! -e $project_two_cache ]] || fail_test 'failed oversized response created a usable project cache'
+
+: >"$FAKE_CURL_LOG"
+FAKE_OVERSIZED_OVERVIEW_HEADERS=1 "$helper" fetch two \
+  >"$test_root/oversized-headers.json" 2>"$test_root/oversized-headers.err"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 1 ]] || fail_test "oversized headers did not stop after one request"
+assert_jq "$test_root/oversized-headers.json" '.projects[] | select(.id == "two") | .ok == false and any(.issues[]; .code == "network")' \
+  'oversized headers were not handled as a bounded transport failure'
+[[ ! -e $project_two_cache ]] || fail_test 'failed oversized headers created a usable project cache'
+
+# Ordinary responses remain valid at the same boundary.
+: >"$FAKE_CURL_LOG"
+"$helper" fetch two >"$test_root/two-normal.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test "normal control refresh issued $request_count requests"
+[[ -f $project_two_cache ]] || fail_test 'normal bounded response did not populate the project cache'
+assert_jq "$test_root/two-normal.json" '.projects[] | select(.id == "two") | .ok == true and ([.charts[] | length <= 28] | all)' \
+  'normal overview or chart data failed the bounded normalizers'
+
+: >"$FAKE_CURL_LOG"
+FAKE_CHART_MEASURE_COUNT=2 "$helper" fetch two >"$test_root/multi-measure-chart.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test 'valid multi-measure chart control did not complete normally'
+assert_jq "$test_root/multi-measure-chart.json" '.projects[] | select(.id == "two") | .ok == true and .stale == false and ([.charts[] | length == 28] | all)' \
+  'valid multi-measure RevenueCat chart response was rejected'
+
+# Shape/cardinality limits prevent a small but adversarial JSON document from
+# expanding into unbounded normalized state.
+: >"$FAKE_CURL_LOG"
+FAKE_OVERVIEW_METRIC_COUNT=65 "$helper" fetch two >"$test_root/excessive-metrics.json"
+assert_jq "$test_root/excessive-metrics.json" '.projects[] | select(.id == "two") | .stale == true and any(.issues[]; .code == "invalid_response")' \
+  'oversized metric array was accepted by normalization'
+: >"$FAKE_CURL_LOG"
+FAKE_CHART_POINT_COUNT=29 "$helper" fetch two >"$test_root/excessive-chart.json"
+assert_jq "$test_root/excessive-chart.json" '.projects[] | select(.id == "two") | .stale == true and any(.issues[]; .code == "invalid_chart") and ([.charts[] | length <= 28] | all)' \
+  'oversized chart array was accepted by normalization'
+
+oversized_projects=$(jq -cn '{items:
+  [{id:"metadata-limit",name:"Metadata Limit"}]
+  + [range(0; 100) | {id:("extra_" + (tostring)),name:"Extra"}]
+}')
+: >"$FAKE_CURL_LOG"
+printf 'sk_metadata_limit\n' | FAKE_PROJECTS_JSON=$oversized_projects \
+  "$helper" configure metadata-limit >/dev/null 2>"$test_root/metadata-limit.err"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 3 ]] || fail_test "metadata cardinality control issued $request_count requests"
+assert_jq "$config_file" '.projects[] | select(.id == "metadata-limit") | .name == "metadata-limit" and .metadataPermission == "error"' \
+  'oversized projects array bypassed metadata normalization'
+
+# Legacy cache values cannot turn Retry-After into a permanent local block.
+clock_rollback_retry=$(( ($(date +%s) + 432000) * 1000 ))
+printf '{"id":"two","retryAfterAt":%s}\n' "$clock_rollback_retry" \
+  >"$XDG_CACHE_HOME/revenue-pulse/projects/two.retry.json"
+touch -d '10 days' "$XDG_CACHE_HOME/revenue-pulse/projects/two.retry.json"
+: >"$FAKE_CURL_LOG"
+"$helper" fetch two >"$test_root/future-mtime-recovered.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test 'a future cache mtime bypassed the current-time Retry-After horizon'
+
+poisoned_retry=9999999999999
+printf '{"id":"two","retryAfterAt":%s}\n' "$poisoned_retry" \
+  >"$XDG_CACHE_HOME/revenue-pulse/projects/two.retry.json"
+jq --argjson retryAfterAt "$poisoned_retry" '.retryAfterAt = $retryAfterAt' \
+  "$project_two_cache" >"$test_root/poisoned-project.json"
+mv -- "$test_root/poisoned-project.json" "$project_two_cache"
+jq --argjson retryAfterAt "$poisoned_retry" '
+  .projects |= map(if .id == "two" then .retryAfterAt = $retryAfterAt else . end)
+' "$cache_file" >"$test_root/poisoned-global.json"
+mv -- "$test_root/poisoned-global.json" "$cache_file"
+: >"$FAKE_CURL_LOG"
+"$helper" fetch two >"$test_root/poisoned-retry-recovered.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test 'legacy poisoned Retry-After blocked recovery'
+[[ ! -e $XDG_CACHE_HOME/revenue-pulse/projects/two.retry.json ]] || fail_test 'successful refresh retained dedicated Retry-After state'
+assert_jq "$project_two_cache" '.retryAfterAt == 0' 'successful refresh retained project Retry-After state'
+assert_jq "$cache_file" '.projects[] | select(.id == "two") | .retryAfterAt == 0' \
+  'successful refresh retained global Retry-After state'
+
+# Upgrades invalidate the old unbounded cache schema before QML sees it, and
+# pre-parse byte gates reclaim oversized legacy artifacts without jq parsing.
+jq 'del(.cacheVersion)' "$project_two_cache" >"$test_root/legacy-project.json"
+mv -- "$test_root/legacy-project.json" "$project_two_cache"
+jq '.schemaVersion = 3 | .projects |= map(if .id == "two" then .metrics.mrr.value = 999999 else . end)' \
+  "$cache_file" >"$test_root/legacy-global.json"
+mv -- "$test_root/legacy-global.json" "$cache_file"
+"$helper" cached >"$test_root/legacy-cache-invalidated.json"
+assert_jq "$test_root/legacy-cache-invalidated.json" '.schemaVersion == 4 and (.projects[] | select(.id == "two") | .ok == false)' \
+  'legacy cache schema remained active after the security upgrade'
+
+: >"$FAKE_CURL_LOG"
+"$helper" fetch two >"$test_root/legacy-project-recovered.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test 'legacy project cache prevented a clean refresh'
+assert_jq "$project_two_cache" '.cacheVersion == 1 and .ok == true' \
+  'refresh did not replace the legacy project cache schema'
+
+truncate -s 262145 "$project_two_cache"
+configured_count=$(jq '.projects | length' "$config_file")
+snapshot_test_limit=$(( 262144 + configured_count * 524288 ))
+truncate -s "$(( snapshot_test_limit + 1 ))" "$cache_file"
+"$helper" cached >"$test_root/oversized-legacy-cache.json"
+[[ ! -e $project_two_cache && ! -e $cache_file ]] || fail_test 'oversized legacy cache files were not reclaimed'
+assert_jq "$test_root/oversized-legacy-cache.json" '.schemaVersion == 4 and (.projects[] | select(.id == "two") | .ok == false)' \
+  'oversized legacy caches reached the returned snapshot'
+
+: >"$FAKE_CURL_LOG"
+"$helper" fetch two >"$test_root/oversized-legacy-recovered.json"
+request_count=$(wc -l <"$FAKE_CURL_LOG")
+[[ $request_count -eq 7 ]] || fail_test 'oversized legacy cache prevented a clean refresh'
+assert_jq "$project_two_cache" '.cacheVersion == 1 and .ok == true' \
+  'refresh did not recreate a bounded project cache'
+[[ -z $(find "$TMPDIR" -mindepth 1 -print -quit) ]] || fail_test 'bounded-response tests leaked temporary API files'
 
 # A refresh that began with old metadata must not overwrite a later reconnect.
 metadata_barrier=$test_root/metadata-fetch
@@ -111,7 +239,7 @@ FAKE_RATE_LIMIT_OVERVIEW=1 "$helper" fetch two >"$test_root/overview-rate-limite
 request_count=$(wc -l <"$FAKE_CURL_LOG")
 [[ $request_count -eq 1 ]] || fail_test "rate-limited overview issued $request_count requests instead of stopping immediately"
 
-# Configure obeys the same stop policy and persists the server's full backoff.
+# Configure obeys the same stop policy and caps hostile server backoff values.
 : >"$FAKE_CURL_LOG"
 limited_before_ms=$(( $(date +%s) * 1000 ))
 printf 'sk_limited\n' | FAKE_RATE_LIMIT_OVERVIEW=1 FAKE_RETRY_AFTER=172800 \
@@ -119,11 +247,26 @@ printf 'sk_limited\n' | FAKE_RATE_LIMIT_OVERVIEW=1 FAKE_RETRY_AFTER=172800 \
 request_count=$(wc -l <"$FAKE_CURL_LOG")
 [[ $request_count -eq 1 ]] || fail_test "rate-limited configure issued $request_count requests instead of stopping immediately"
 limited_retry_file=$XDG_CACHE_HOME/revenue-pulse/projects/limited.retry.json
-assert_jq "$limited_retry_file" ".retryAfterAt >= ($limited_before_ms + 172790000)" \
-  'a long Retry-After deadline was shortened'
+assert_jq "$limited_retry_file" ".retryAfterAt >= ($limited_before_ms + 86390000) and .retryAfterAt <= ($limited_before_ms + 86410000)" \
+  'a long numeric Retry-After was not capped to the 24-hour policy'
 : >"$FAKE_CURL_LOG"
 "$helper" fetch limited >"$test_root/configure-retry-blocked.json"
 [[ ! -s $FAKE_CURL_LOG ]] || fail_test 'configured project ignored its persisted Retry-After window'
+
+http_retry_before_ms=$(( $(date +%s) * 1000 ))
+http_retry_date=$(date -u -d '10 days' '+%a, %d %b %Y %H:%M:%S GMT')
+printf 'sk_http_limited\n' | FAKE_RATE_LIMIT_OVERVIEW=1 FAKE_RETRY_AFTER=$http_retry_date \
+  "$helper" configure http-limited >/dev/null 2>"$test_root/configure-http-limited.err"
+http_retry_file=$XDG_CACHE_HOME/revenue-pulse/projects/http-limited.retry.json
+assert_jq "$http_retry_file" ".retryAfterAt >= ($http_retry_before_ms + 86390000) and .retryAfterAt <= ($http_retry_before_ms + 86410000)" \
+  'a long HTTP-date Retry-After was not capped to the 24-hour policy'
+
+# A successful explicit reconnect clears every persisted backoff copy.
+printf 'sk_limited\n' | "$helper" configure limited >/dev/null 2>"$test_root/reconfigure-limited.err"
+[[ ! -e $limited_retry_file ]] || fail_test 'successful reconnect retained dedicated Retry-After state'
+: >"$FAKE_CURL_LOG"
+"$helper" fetch limited >"$test_root/reconfigured-limited.json"
+[[ -s $FAKE_CURL_LOG ]] || fail_test 'successful reconnect did not recover from old Retry-After state'
 
 # Retry state survives a concurrent currency/context change even though the
 # metric result itself is intentionally incompatible with the new currency.
@@ -248,6 +391,7 @@ fi
 grep -q 'function currentIconUrl()' "$repo_dir/Service.qml" || fail_test 'icon defense-in-depth function is missing'
 grep -q 'root.service.leaveDemo(false)' "$repo_dir/Panel.qml" || fail_test 'display settings still request a due network refresh'
 grep -q 'invalid snapshot shape' "$repo_dir/Service.qml" || fail_test 'helper payload shape is not validated'
+grep -q 'Number(parsed.schemaVersion) === 4' "$repo_dir/Service.qml" || fail_test 'QML does not require the hardened snapshot schema'
 grep -q 'onStreamFinished: root.fetchOutput = text' "$repo_dir/Service.qml" || fail_test 'fetch output is still applied before exit status is known'
 grep -q 'function leaveDemo(refreshAfterLoad)' "$repo_dir/Service.qml" || fail_test 'demo exit does not clear temporary view settings'
 plugin_id=$(jq -r '.id' "$repo_dir/manifest.json")

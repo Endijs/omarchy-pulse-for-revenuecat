@@ -17,6 +17,7 @@ while (( $# > 0 )); do
     --dump-header) headers=${2:-}; shift ;;
     --write-out) shift ;;
     --config) shift ;;
+    --max-filesize) shift ;;
   esac
   shift
 done
@@ -49,26 +50,58 @@ if [[ ${FAKE_RATE_LIMIT_OVERVIEW:-0} == 1 && $url == */metrics/overview* ]]; the
   exit 0
 fi
 
+if [[ ${FAKE_OVERSIZED_OVERVIEW_HEADERS:-0} == 1 && $url == */metrics/overview* ]]; then
+  dd if=/dev/zero of="$headers" bs=1024 count=129 status=none
+fi
+
 case $url in
   *'/v2/projects?'*)
     projects_json=${FAKE_PROJECTS_JSON:-'{"items":[]}'}
     printf '%s\n' "$projects_json" >"$output"
     ;;
   *'/metrics/overview?'*)
-    printf '%s\n' '{"metrics":[
-      {"id":"mrr","name":"MRR","value":1250,"unit":"$","period":"P0D","last_updated_at":1700000000000},
-      {"id":"revenue","name":"Revenue","value":3900,"unit":"$","period":"P28D","last_updated_at":1700000000000},
-      {"id":"active_subscriptions","value":42,"unit":"#","period":"P0D"},
-      {"id":"active_trials","value":3,"unit":"#","period":"P0D"},
-      {"id":"new_customers","value":12,"unit":"#","period":"P28D"},
-      {"id":"active_users","value":85,"unit":"#","period":"P28D"}
-    ]}' >"$output"
+    if [[ ${FAKE_OVERSIZED_OVERVIEW_BODY:-0} == 1 ]]; then
+      dd if=/dev/zero of="$output" bs=1024 count=1025 status=none
+    elif [[ -n ${FAKE_OVERVIEW_METRIC_COUNT:-} ]]; then
+      jq -cn --argjson count "$FAKE_OVERVIEW_METRIC_COUNT" '
+        {metrics:[range(0; $count) | {
+          id:("unknown_" + (tostring)), name:"Unknown", value:1,
+          unit:"#", period:"P0D", last_updated_at:1700000000000
+        }]}
+      ' >"$output"
+    else
+      printf '%s\n' '{"metrics":[
+        {"id":"mrr","name":"MRR","value":1250,"unit":"$","period":"P0D","last_updated_at":1700000000000},
+        {"id":"revenue","name":"Revenue","value":3900,"unit":"$","period":"P28D","last_updated_at":1700000000000},
+        {"id":"active_subscriptions","value":42,"unit":"#","period":"P0D"},
+        {"id":"active_trials","value":3,"unit":"#","period":"P0D"},
+        {"id":"new_customers","value":12,"unit":"#","period":"P28D"},
+        {"id":"active_users","value":85,"unit":"#","period":"P28D"}
+      ]}' >"$output"
+    fi
     ;;
   *'/charts/'*)
-    printf '%s\n' '{"values":[
-      {"measure":0,"cohort":1699833600,"value":10,"incomplete":false},
-      {"measure":0,"cohort":1699920000,"value":12,"incomplete":false}
-    ]}' >"$output"
+    if [[ -n ${FAKE_CHART_MEASURE_COUNT:-} ]]; then
+      jq -cn --argjson measures "$FAKE_CHART_MEASURE_COUNT" '
+        {values:[range(0; 28) as $day | range(0; $measures) as $measure | {
+          measure:$measure,
+          cohort:(1699833600 + ($day * 86400)),
+          value:($day + $measure),
+          incomplete:false
+        }]}
+      ' >"$output"
+    elif [[ -n ${FAKE_CHART_POINT_COUNT:-} ]]; then
+      jq -cn --argjson count "$FAKE_CHART_POINT_COUNT" '
+        {values:[range(0; $count) | {
+          measure:0, cohort:(1699833600 + (. * 86400)), value:., incomplete:false
+        }]}
+      ' >"$output"
+    else
+      printf '%s\n' '{"values":[
+        {"measure":0,"cohort":1699833600,"value":10,"incomplete":false},
+        {"measure":0,"cohort":1699920000,"value":12,"incomplete":false}
+      ]}' >"$output"
+    fi
     ;;
   *)
     printf '{}\n' >"$output"

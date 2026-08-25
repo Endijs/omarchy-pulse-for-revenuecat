@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.endijs.pulse-for-revenuecat",
   "name": "Pulse for RevenueCat",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Endijs",
   "license": "MIT",
   "description": "An unofficial multi-project RevenueCat metrics dashboard for Omarchy",

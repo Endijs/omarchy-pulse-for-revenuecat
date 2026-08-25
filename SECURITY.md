@@ -11,6 +11,18 @@ pass it to `curl` through a stdin configuration stream, keeping it out of the
 process command line. API calls use HTTPS and request only aggregate chart and
 overview data.
 
+All RevenueCat calls pass through one bounded response boundary. `curl` has a
+1 MiB body limit, while an OS file-size resource limit covers both the body and
+the separately written header file even for chunked or unknown-length
+responses. The helper verifies the resulting body is at most 1 MiB and headers
+are at most 128 KiB before `awk` or `jq` reads them, deletes raw responses after
+normalization, and rejects arrays beyond the expected endpoint cardinality.
+Server-provided `Retry-After` values are capped at 24 hours; legacy out-of-range
+cache values are ignored and successful requests clear persisted backoff state.
+Snapshot and per-project cache schemas are versioned, and cached artifacts have
+pre-parse size limits derived from the configured project count. Oversized
+legacy caches are removed under the configuration lock during startup recovery.
+
 For the developer preview, users should create one dedicated API v2 key per
 project with only:
 

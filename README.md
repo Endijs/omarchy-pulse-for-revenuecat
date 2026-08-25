@@ -28,7 +28,8 @@ _The bar can show compact MRR or 28-day revenue for all projects or the selected
 
 - Omarchy Quattro with third-party Quickshell plugin support
 - One or more RevenueCat projects with production purchase data
-- `curl`, `jq`, `flock` from `util-linux`, and `secret-tool` from `libsecret`
+- `curl`, `jq`, `flock` from `util-linux`, `stat` from GNU coreutils, and
+  `secret-tool` from `libsecret`
 - An unlocked desktop Secret Service/keyring
 
 No root access, background system service, or PolicyKit rule is required.
@@ -156,7 +157,9 @@ panel or switching between totals and projects uses the same per-project
 freshness check. Only projects whose interval has elapsed are requested. The
 panel Refresh button and the bar widget's right-click action explicitly
 override the configured interval for their current scope. Server-provided
-RevenueCat `Retry-After` limits are still honored before any further attempt.
+RevenueCat `Retry-After` limits are still honored before any further attempt,
+up to a defensive maximum of 24 hours. A successful reconnect or refresh
+clears old backoff state.
 The setup screen appears only
 after the helper confirms that no projects are configured.
 
@@ -172,6 +175,12 @@ Chart requests cover an inclusive UTC range from 27 days ago through today.
 Today's flow metrics may therefore be partial. The overview cards use the
 28-day values returned directly by RevenueCat. RevenueCat's mobile app can also
 show slightly different values while it uses a different Charts generation.
+
+Every API transfer has a 1 MiB body ceiling and a separate 128 KiB response
+header ceiling before local parsing. The helper also bounds project metadata,
+overview metrics, and chart point counts before normalization. Responses that
+exceed those limits are discarded and handled like an unavailable or malformed
+API response, with an existing sanitized cache used when possible.
 
 ## Demo mode
 
